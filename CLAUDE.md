@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Purpose
 
-Cross-platform (Windows/macOS/Linux) GUI for batch video conversion to HEVC or AV1, with
-automatic hardware-encoder detection (Intel QSV, AMD AMF, NVIDIA NVENC, Apple VideoToolbox, or
-software libx265/libsvtav1) and smart scaling to a max of 1080p. Also handles muxing (track
-add/remove/extract) and chapter editing. Evolution of an earlier batch script,
-`all2mkva_max1080p_qsv.bat`.
+Cross-platform (Windows/macOS/Linux) video toolkit, not just a batch encoder: encode to HEVC/AV1
+with automatic hardware-encoder detection (Intel QSV, AMD AMF, NVIDIA NVENC, Apple VideoToolbox,
+or software libx265/libsvtav1), mux tracks (add/remove/extract), and edit chapters — each with
+fine per-file control (stream selection, trim, real bitrate, track titles, tag fixes) for files
+that differ from one another. The Encode tab *can* run across a whole folder at once, which is
+the useful case for a batch of similar-source footage (e.g. clips from the same phone/camcorder
+sharing the same settings) — but that's one mode among several, not the app's main purpose.
+Encoding grew out of an earlier batch script, `all2mkva_max1080p_qsv.bat`; Mux and Chapters were
+added afterward as genuinely per-file tools.
 
 ## Running the Application
 

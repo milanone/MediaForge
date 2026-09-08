@@ -1,14 +1,18 @@
 # MediaForge
 
-Cross-platform (Windows/macOS/Linux) GUI for batch video conversion to HEVC or AV1, with
-automatic hardware-encoder detection — Intel QuickSync, AMD AMF, NVIDIA NVENC, Apple
-VideoToolbox — or software encoding (libx265/libsvtav1), plus track muxing and chapter editing.
+Cross-platform (Windows/macOS/Linux) video toolkit — encode to HEVC/AV1 with automatic
+hardware-encoder detection (Intel QuickSync, AMD AMF, NVIDIA NVENC, Apple VideoToolbox, or
+software libx265/libsvtav1), mux tracks, and edit chapters. Built around fine per-file control
+(stream selection, trim, real bitrate, track titles, tag fixes) for files that differ from one
+another, rather than around batch processing — encoding can also run across a whole folder at
+once, which is mainly useful when the source files are similar (e.g. clips from the same phone
+or camcorder sharing the same settings).
 
 ## Features
 
-- **Encode**: batch-convert a folder of videos to HEVC or AV1, with smart scaling capped at
-  1080p, aspect ratio/FPS/flip filters, per-stream selection (video/audio/subtitles), trim, and
-  a live command preview
+- **Encode**: HEVC or AV1, with smart scaling capped at 1080p, aspect ratio/FPS/flip filters,
+  per-stream selection (video/audio/subtitles), trim, and a live command preview — for one file
+  with its own settings, or a whole folder of similar files at once
 - Available encoders are detected automatically at startup by actually probing ffmpeg on the
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)
