@@ -8,6 +8,12 @@ another, rather than around batch processing — encoding can also run across a 
 once, which is mainly useful when the source files are similar (e.g. clips from the same phone
 or camcorder sharing the same settings).
 
+**Why HEVC/AV1**: these are the two codec families actually worth targeting today. HEVC is the
+most advanced codec with genuinely wide playback compatibility (hardware decode on essentially
+every modern TV, phone, and media player); AV1 compresses better still, but needs dedicated
+encode/decode hardware to be practical and is supported by fewer players — worth it when you
+control the playback side, not a safe default otherwise.
+
 ## Features
 
 - **Encode**: HEVC or AV1, with smart scaling capped at 1080p, aspect ratio/FPS/flip filters,
