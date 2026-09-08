@@ -14,6 +14,8 @@ every modern TV, phone, and media player); AV1 compresses better still, but need
 encode/decode hardware to be practical and is supported by fewer players — worth it when you
 control the playback side, not a safe default otherwise.
 
+![MediaForge screenshot](screenshot.png)
+
 ## Features
 
 - **Encode**: HEVC or AV1, with smart scaling capped at 1080p, aspect ratio/FPS/flip filters,
