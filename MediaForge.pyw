@@ -1028,11 +1028,19 @@ def build_fixbitrate_cmd(src: Path, dst: Path, bitrate_video: int) -> list:
     valore REALE appena calcolato (bitrate_video_esatto), senza ricodificare
     nulla (vedi fix_bitrate_tag per il resto: data file preservata).
     bitrate_video None/0 -> il tag viene solo svuotato (nessun valore
-    attendibile da scrivere)."""
+    attendibile da scrivere). Svuota anche gli altri tag statistici mkvmerge
+    (STATS_TAGS_MKV) rimasti stantii sul file da correggere: -map_metadata 0
+    li copierebbe altrimenti tali e quali da src a dst, e con BPS ormai
+    corretto MediaInfo/mkvmerge tornerebbero comunque a calcolare il bitrate
+    da NUMBER_OF_BYTES/DURATION stantii (stesso bug di build_ffmpeg_cmd)."""
     valore = str(bitrate_video) if bitrate_video else ""
-    return ["ffmpeg", "-y", "-i", str(src), "-map", "0", "-map_metadata", "0", "-c", "copy",
-            "-metadata:s:v:0", f"BPS={valore}", "-metadata:s:v:0", f"BPS-eng={valore}",
-            str(dst)]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-map", "0", "-map_metadata", "0", "-c", "copy",
+           "-metadata:s:v:0", f"BPS={valore}", "-metadata:s:v:0", f"BPS-eng={valore}"]
+    for tag in STATS_TAGS_MKV:
+        if tag not in ("BPS", "BPS-eng"):
+            cmd += ["-metadata:s:v:0", f"{tag}="]
+    cmd.append(str(dst))
+    return cmd
 
 
 def build_mux_cmd(src: Path, src_data: dict, stream_map: list,
