@@ -3019,22 +3019,28 @@ class App(_BaseTk):
             return
 
         if dichiarato is None:
-            messagebox.showinfo("Verifica bitrate",
-                f"Nessun bitrate dichiarato nel file da confrontare.\n"
-                f"Bitrate reale: {reale // 1000}kbps.")
-            return
-
-        if not bitrate_scarto_reale(dichiarato, reale):
+            # Nessun BPS da confrontare, ma il file potrebbe avere comunque
+            # tag statistici stantii (NUMBER_OF_BYTES/DURATION, vedi
+            # STATS_TAGS_MKV) che ingannano MediaInfo pur senza un BPS
+            # esplicito: proponiamo la stessa correzione del caso "scarto
+            # rilevato" invece di limitarci a informare e non fare nulla.
+            domanda = (f"Nessun bitrate dichiarato nel file da confrontare.\n"
+                       f"Bitrate reale: {reale // 1000}kbps.\n\n"
+                       "Il file potrebbe comunque avere tag statistici stantii "
+                       "(es. NUMBER_OF_BYTES) che ingannano MediaInfo: scrivere "
+                       "il bitrate reale nel tag e pulirli (nessuna ricodifica)?")
+        elif not bitrate_scarto_reale(dichiarato, reale):
             messagebox.showinfo("Verifica bitrate",
                 f"Il bitrate dichiarato è corretto.\n\n"
                 f"Dichiarato: {dichiarato // 1000}kbps  —  Reale: {reale // 1000}kbps.")
             return
+        else:
+            domanda = (f"Il bitrate dichiarato ({dichiarato // 1000}kbps) NON corrisponde a "
+                       f"quello reale ({reale // 1000}kbps) — probabilmente un tag rimasto da "
+                       "una ricodifica precedente.\n\nCorreggerlo subito su questo file "
+                       "(nessuna ricodifica, solo il tag)?")
 
-        if not messagebox.askyesno("Verifica bitrate",
-                f"Il bitrate dichiarato ({dichiarato // 1000}kbps) NON corrisponde a "
-                f"quello reale ({reale // 1000}kbps) — probabilmente un tag rimasto da "
-                "una ricodifica precedente.\n\nCorreggerlo subito su questo file "
-                "(nessuna ricodifica, solo il tag)?"):
+        if not messagebox.askyesno("Verifica bitrate", domanda):
             return
 
         log_q = queue.Queue()
@@ -3505,7 +3511,14 @@ class App(_BaseTk):
                 if reale is None:
                     righe.append(f"?  {f.name} — bitrate reale non calcolabile")
                 elif dichiarato is None:
-                    righe.append(f"?  {f.name} — nessun valore dichiarato (reale: {reale // 1000}kbps)")
+                    # Nessun BPS da confrontare, ma potrebbero restare tag
+                    # statistici stantii (NUMBER_OF_BYTES/DURATION, vedi
+                    # STATS_TAGS_MKV) che ingannano MediaInfo lo stesso: va
+                    # corretto anche in questo caso, scrivendo il BPS reale
+                    # appena calcolato e pulendo quei tag (fix_bitrate_tag).
+                    righe.append(f"⚠  {f.name} — nessun valore dichiarato "
+                                  f"(reale: {reale // 1000}kbps)")
+                    da_correggere.append((f, reale))
                 elif not bitrate_scarto_reale(dichiarato, reale):
                     righe.append(f"✓  {f.name} — già corretto ({dichiarato // 1000}kbps)")
                 else:
