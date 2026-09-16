@@ -28,6 +28,10 @@ control the playback side, not a safe default otherwise.
 - Available encoders are detected automatically at startup by actually probing ffmpeg on the
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)
+- On Windows with a QSV encoder, input decoding uses hardware acceleration (`d3d11va`), picking
+  the matching 8-bit/10-bit pixel format from the source so HDR/10-bit files keep their color
+  depth instead of being silently truncated
+- Log panel text is selectable and copyable (mouse or Ctrl+C/Ctrl+A) while staying read-only
 - Exact real video bitrate (from packet sizes, not an estimate) and two maintenance tools: fix
   the HEVC tag some players need for HEVC-in-MP4, and fix a stale/wrong bitrate tag
 - Audio-only mode for extracting/transcoding just the audio track
