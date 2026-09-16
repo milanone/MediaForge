@@ -47,6 +47,17 @@ AUDIO_ONLY_EXT = {"copy": "mka", "aac": "aac", "ac3": "ac3", "mp3": "mp3"}
 
 TIPO_ICONA = {"video": "🎬", "audio": "🔊", "subtitle": "💬", "data": "📦"}
 
+# Tag statistici che mkvmerge scrive per traccia (BPS, DURATION,
+# NUMBER_OF_FRAMES, NUMBER_OF_BYTES, entrambi anche in versione "-eng"):
+# -map_metadata 0 li copia alla cieca dal sorgente anche quando lo stream
+# viene ricodificato a un peso/bitrate completamente diversi, ingannando
+# MediaInfo e mkvmerge stessi (che senza un BPS esplicito calcolano il
+# bitrate da NUMBER_OF_BYTES/DURATION, tornando comunque al valore stantio
+# del sorgente) — vanno quindi svuotati esplicitamente sugli stream ricodificati.
+STATS_TAGS_MKV = ("BPS", "BPS-eng", "DURATION", "DURATION-eng",
+                  "NUMBER_OF_FRAMES", "NUMBER_OF_FRAMES-eng",
+                  "NUMBER_OF_BYTES", "NUMBER_OF_BYTES-eng")
+
 
 def bitrate_video_esatto(path: Path, durata_sec: float):
     """Bitrate REALE (non stimato) del flusso video: somma i byte di ogni
@@ -625,23 +636,33 @@ def _build_audio_cmd(src: Path, dst: Path, opts: dict, streams: list) -> list:
     if opts.get("stream_map"):
         # Selezione manuale (file singolo): tiene solo gli indici che sono audio,
         # anche se in stream_map fossero rimasti indici video/sottotitoli spuntati
+        n_audio = 0
         for idx in opts["stream_map"]:
             if idx < len(streams) and streams[idx].get("codec_type") == "audio":
                 cmd += ["-map", f"0:{idx}"]
+                n_audio += 1
     else:
         cmd += ["-map", "0:a"]
+        n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
 
     cmd += ["-map_metadata", "0", "-vn"]
 
     audio = opts.get("audio", "copy")
     if audio == "copy":
         cmd += ["-c:a", "copy"]
-    elif audio == "aac":
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    elif audio == "ac3":
-        cmd += ["-c:a", "ac3", "-b:a", "384k"]
-    elif audio == "mp3":
-        cmd += ["-c:a", "mp3", "-b:a", "128k", "-ar", "44100"]
+    else:
+        if audio == "aac":
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+        elif audio == "ac3":
+            cmd += ["-c:a", "ac3", "-b:a", "384k"]
+        elif audio == "mp3":
+            cmd += ["-c:a", "mp3", "-b:a", "128k", "-ar", "44100"]
+        # Stesso problema di build_ffmpeg_cmd: -map_metadata 0 copierebbe
+        # alla cieca i tag statistici mkvmerge del sorgente (STATS_TAGS_MKV)
+        # anche col nuovo bitrate fisso scelto qui.
+        for i in range(n_audio):
+            for tag in STATS_TAGS_MKV:
+                cmd += [f"-metadata:s:a:{i}", f"{tag}="]
 
     cmd.append(str(dst))
     return cmd
@@ -915,16 +936,13 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         _, famiglia = VIDEO_ENCODERS.get(opts.get("vcodec"), (None, "hevc"))
         video_is_hevc = famiglia == "hevc"
         if video is not None:
-            # -map_metadata 0 copia alla cieca il tag statistico "BPS"/
-            # "BPS-eng" del sorgente anche quando il video viene RICODIFICATO
-            # a un bitrate completamente diverso: verificato con un file
-            # reale che il tag resta quello vecchio (es. 2763kbps) anche se
-            # il file finale pesa una frazione e il bitrate vero è crollato —
-            # ingannando MediaInfo e qualunque altro strumento, questa stessa
-            # app inclusa (vedi descrivi_stream). Lo svuotiamo esplicitamente
-            # sullo stream video di output (":v:0", quasi sempre l'unico:
-            # più tracce video non sono un caso gestito da questa app).
-            cmd += ["-metadata:s:v:0", "BPS=", "-metadata:s:v:0", "BPS-eng="]
+            # -map_metadata 0 copia alla cieca i tag statistici mkvmerge del
+            # sorgente (vedi STATS_TAGS_MKV) anche quando il video viene
+            # RICODIFICATO a un peso/bitrate completamente diversi: li
+            # svuotiamo sullo stream video di output (":v:0", quasi sempre
+            # l'unico: più tracce video non sono un caso gestito da questa app).
+            for tag in STATS_TAGS_MKV:
+                cmd += ["-metadata:s:v:0", f"{tag}="]
 
     if video_is_hevc and opts.get("output_ext") == "mp4":
         # ffmpeg marca l'HEVC in MP4 come "hev1" di default: QuickTime/iOS/macOS
@@ -942,16 +960,18 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             cmd += ["-c:a", "ac3", "-b:a", "384k"]
         elif opts["audio"] == "mp3":
             cmd += ["-c:a", "mp3", "-b:a", "128k", "-ar", "44100"]
-        # Stesso problema del video qui sopra: pulisce il tag BPS/BPS-eng
-        # ereditato dal sorgente su ogni stream audio effettivamente
-        # ricodificato (non più valido col nuovo bitrate fisso scelto).
+        # Stesso problema del video qui sopra: pulisce i tag statistici
+        # mkvmerge (STATS_TAGS_MKV) ereditati dal sorgente su ogni stream
+        # audio effettivamente ricodificato (non più validi col nuovo
+        # bitrate fisso scelto).
         if opts.get("stream_map"):
             n_audio = sum(1 for i in opts["stream_map"]
                           if i < len(streams) and streams[i].get("codec_type") == "audio")
         else:
             n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
         for i in range(n_audio):
-            cmd += [f"-metadata:s:a:{i}", "BPS=", f"-metadata:s:a:{i}", "BPS-eng="]
+            for tag in STATS_TAGS_MKV:
+                cmd += [f"-metadata:s:a:{i}", f"{tag}="]
 
     # --- Sottotitoli ---
     subs = opts.get("subs", "copy")
