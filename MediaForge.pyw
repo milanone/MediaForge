@@ -825,6 +825,15 @@ def usa_hwaccel_decode(vcodec: str) -> bool:
     return sys.platform == "win32" and vcodec in ("hevc_qsv", "av1_qsv")
 
 
+def hwaccel_output_format(video: dict) -> str:
+    """nv12 (8 bit) o p010le (10 bit) in base al pix_fmt della sorgente:
+    forzare nv12 su una sorgente a 10 bit (es. HDR10) tronca la profondità
+    colore prima che i frame arrivino all'encoder QSV, che segnala poi
+    "incompatible video parameters" per il mismatch coi metadati HDR."""
+    pix_fmt = (video or {}).get("pix_fmt", "")
+    return "p010le" if "10le" in pix_fmt or "10be" in pix_fmt else "nv12"
+
+
 def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: list = None,
                       hwaccel_decode: bool = True) -> list:
     """warnings, se passata, viene riempita con eventuali avvisi da mostrare
@@ -859,12 +868,15 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
 
     cmd = ["ffmpeg", "-y"]
     if hwaccel_decode and usa_hwaccel_decode(opts.get("vcodec")):
-        # hwaccel_output_format nv12 forza i frame decodificati in memoria di
+        # hwaccel_output_format forza i frame decodificati in memoria di
         # sistema (non surface GPU "zero-copy"): così i filtri software già
         # esistenti (crop/pad/scale/setdar/hflip/ecc., vedi vf_filters sopra)
         # continuano a funzionare invariati, e l'encoder qsv in uscita accetta
-        # comunque i frame nv12 (li ricarica lui stesso sulla GPU).
-        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "nv12"]
+        # comunque questi frame (li ricarica lui stesso sulla GPU). nv12 per
+        # sorgenti 8 bit, p010le per 10 bit/HDR (vedi hwaccel_output_format()):
+        # forzare nv12 su una sorgente 10 bit troncherebbe la profondità colore.
+        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format",
+                hwaccel_output_format(video)]
     if opts.get("ss"):
         cmd += ["-ss", opts["ss"]]
     cmd += ["-i", str(src)]
@@ -2574,9 +2586,13 @@ class App(_BaseTk):
         frm_log.pack(fill="both", expand=True, **pad)
         mono = font.Font(family="Consolas", size=9)
         self._log = scrolledtext.ScrolledText(
-            frm_log, wrap="word", font=mono, height=10, state="disabled",
+            frm_log, wrap="word", font=mono, height=10,
             background="#1e1e1e", foreground="#d4d4d4")
         self._log.pack(fill="both", expand=True, padx=5, pady=5)
+        # Il widget resta in stato "normal" (non "disabled") così il testo si
+        # può selezionare e copiare col mouse/Ctrl+C; questo binding blocca
+        # solo digitazione/incolla, lasciando passare navigazione e Ctrl+C/A.
+        self._log.bind("<Key>", self._log_key_block)
         for tag, fg in [("info","#569cd6"),("ok","#4ec9b0"),("error","#f44747"),
                         ("cmd","#555555"),("detail","#808080"),("warning","#cc9944"),
                         ("progress","#dcdcaa"),("summary","#ce9178")]:
@@ -4198,16 +4214,23 @@ class App(_BaseTk):
     # Log
     # -----------------------------------------------------------------------
 
+    def _log_key_block(self, event):
+        """Blocca digitazione/incolla nel log (sola lettura) lasciando passare
+        navigazione e le scorciatoie di copia/selezione (Ctrl+C/Ctrl+A)."""
+        if event.state & 0x4 and event.keysym.lower() in ("c", "a"):
+            return None
+        if event.keysym in ("Up", "Down", "Left", "Right", "Home", "End",
+                             "Prior", "Next", "Shift_L", "Shift_R",
+                             "Control_L", "Control_R"):
+            return None
+        return "break"
+
     def _log_clear(self):
-        self._log.configure(state="normal")
         self._log.delete("1.0", "end")
-        self._log.configure(state="disabled")
 
     def _log_write(self, tag: str, text: str):
-        self._log.configure(state="normal")
         self._log.insert("end", text + "\n", tag)
         self._log.see("end")
-        self._log.configure(state="disabled")
 
     def _poll_log(self):
         try:
@@ -4233,11 +4256,9 @@ class App(_BaseTk):
                     for i in range(3):
                         self.after(i * 250, self.bell)
                 elif tag == "progress":
-                    self._log.configure(state="normal")
                     self._log.delete("end-2l", "end-1l")
                     self._log.insert("end", msg + "\n", tag)
                     self._log.see("end")
-                    self._log.configure(state="disabled")
                 else:
                     self._log_write(tag, msg)
         except queue.Empty:
