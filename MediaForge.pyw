@@ -229,44 +229,20 @@ def crf_suggerito(width, height, encoder=None) -> int:
     1920px di lato lungo (1080p). Usa il lato lungo (non solo l'altezza) così
     un video verticale (es. da telefono) è trattato in base alla stessa
     "quantità" di pixel di un equivalente orizzontale.
-    encoder, se passato, applica uno scarto indipendente per famiglia/
-    hardware, calibrato su test reali (stesso file, stesso CRF, confronto
-    diretto tra encoder) più che su un'unica regola teorica:
-    1) famiglia "av1" SOFTWARE (libsvtav1/librav1e, vedi VIDEO_ENCODERS): AV1
-       è più efficiente di HEVC/H.264 a parità di numero, quindi lo stesso
-       CRF calcolato per HEVC darebbe su AV1 un file più piccolo ma di
-       qualità percepita inferiore — un CRF più basso (qui -4, valore
-       intermedio tra quelli comunemente citati) riporta la qualità
-       percepita allo stesso livello, mantenendo comunque il file più
-       piccolo grazie alla maggiore efficienza del codec. Esclude
-       deliberatamente av1_qsv, vedi punto 3;
-    2) encoder "hevc_qsv": "-global_quality" su QSV è la modalità ICQ di
-       Intel, che condivide la scala numerica del CRF ma non la sua
-       efficienza — verificato su un file reale (Matrix 4K HDR) che lo
-       stesso numero usato per x265 software produce con QSV una
-       compressione molto più aggressiva (0.007 bit/pixel/frame,
-       visibilmente sotto la norma per HEVC 4K). Un CRF più basso (qui -3)
-       compensa avvicinando la qualità percepita a quella che lo stesso
-       numero darebbe in software;
-    3) encoder "av1_qsv": NON condivide il -3 di hevc_qsv. Un confronto
-       diretto (stesso file Matrix 4K, stesso CRF 25) ha misurato hevc_qsv
-       a ~3Mbps e av1_qsv a ~4Mbps: a parità di bitrate l'AV1 dovrebbe
-       rendere meglio, quindi a parità di QUALITÀ percepita gli serve un
-       numero più alto (più compressione) di hevc_qsv, non lo stesso — qui
-       -1 rispetto alla base HEVC software (quindi +2 rispetto a hevc_qsv),
-       valore approssimativo dedotto da un singolo confronto, da rifinire
-       con altri test se necessario. Il hardware AV1 di questa app include
-       anche chip diversi da quello testato: se in futuro emergessero
-       differenze significative tra GPU, valga la pena rendere lo scarto
-       specifico anche per marca (Intel/AMD/NVIDIA), non solo per famiglia."""
+    encoder, se passato, applica un solo scarto: -1 per l'intera famiglia
+    "av1" (hardware o software, vedi VIDEO_ENCODERS), AV1 essendo
+    generalmente considerato un po' più efficiente di HEVC a parità di
+    numero. Nessuna distinzione hardware/software (né per HEVC né per
+    AV1): un tentativo di scarto specifico per hevc_qsv (-3, dedotto da
+    un'unica misurazione su un file 4K HDR particolarmente ostico — grana
+    pesante, HDR, causa anche altri problemi non legati al CRF) non aveva
+    riscontro solido in fonti esterne, che anzi riportano una penalità
+    minima per hevc_qsv su hardware Intel recente: tolto in attesa di dati
+    più affidabili."""
     lato_lungo = max(int(width or 0), int(height or 0))
     base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
-    if famiglia == "av1" and encoder != "av1_qsv":
-        base -= 4
-    if encoder == "hevc_qsv":
-        base -= 3
-    elif encoder == "av1_qsv":
+    if famiglia == "av1":
         base -= 1
     return max(1, min(51, round(base)))
 
