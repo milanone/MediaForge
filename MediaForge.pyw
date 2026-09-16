@@ -228,18 +228,27 @@ def crf_suggerito(width, height, encoder=None) -> int:
     1920px di lato lungo (1080p). Usa il lato lungo (non solo l'altezza) così
     un video verticale (es. da telefono) è trattato in base alla stessa
     "quantità" di pixel di un equivalente orizzontale.
-    encoder, se passato, applica uno scarto per la famiglia "av1" (vedi
-    VIDEO_ENCODERS): AV1 è più efficiente di HEVC/H.264 a parità di numero,
-    quindi lo stesso CRF calcolato per HEVC darebbe su AV1 un file più
-    piccolo ma di qualità percepita inferiore — un CRF più basso (qui -4,
-    valore intermedio tra quelli comunemente citati) riporta la qualità
-    percepita allo stesso livello, mantenendo comunque il file più piccolo
-    grazie alla maggiore efficienza del codec."""
+    encoder, se passato, applica due scarti indipendenti:
+    1) famiglia "av1" (vedi VIDEO_ENCODERS): AV1 è più efficiente di HEVC/
+       H.264 a parità di numero, quindi lo stesso CRF calcolato per HEVC
+       darebbe su AV1 un file più piccolo ma di qualità percepita inferiore
+       — un CRF più basso (qui -4, valore intermedio tra quelli comunemente
+       citati) riporta la qualità percepita allo stesso livello, mantenendo
+       comunque il file più piccolo grazie alla maggiore efficienza del codec;
+    2) encoder "hevc_qsv"/"av1_qsv": "-global_quality" su QSV è la modalità
+       ICQ di Intel, che condivide la scala numerica del CRF ma non la sua
+       efficienza — verificato su un file reale (Matrix 4K HDR) che lo stesso
+       numero usato per x265 software produce con QSV una compressione molto
+       più aggressiva (0.007 bit/pixel/frame, visibilmente sotto la norma per
+       HEVC 4K). Un CRF più basso (qui -3) compensa avvicinando la qualità
+       percepita a quella che lo stesso numero darebbe in software."""
     lato_lungo = max(int(width or 0), int(height or 0))
     base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
     if famiglia == "av1":
         base -= 4
+    if encoder in ("hevc_qsv", "av1_qsv"):
+        base -= 3
     return max(1, min(51, round(base)))
 
 
