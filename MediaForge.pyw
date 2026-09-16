@@ -2,7 +2,8 @@
 """
 GUI cross-platform (Windows / macOS / Linux) per conversione video HEVC o AV1
 con encoder hardware selezionabile — Intel QSV, AMD AMF, NVIDIA NVENC, Apple
-VideoToolbox — o software (libx265 / libsvtav1), e scaling intelligente a max 1080p.
+VideoToolbox — o software (libx265 / libsvtav1), con limite di risoluzione opzionale
+(1080p/720p, disattivato di default).
 Gli encoder disponibili vengono rilevati automaticamente da ffmpeg all'avvio,
 così il programma propone quello giusto su ogni macchina (AMF su PC AMD, QSV su
 Intel, VideoToolbox su Mac Apple Silicon…).
@@ -250,6 +251,26 @@ def crf_suggerito(width, height, encoder=None) -> int:
     if encoder in ("hevc_qsv", "av1_qsv"):
         base -= 3
     return max(1, min(51, round(base)))
+
+
+def risoluzione_effettiva(width, height, limite) -> tuple:
+    """Dimensioni EFFETTIVE del video dopo l'eventuale scala a "Risoluzione
+    max" (limite_res, vedi costruisci_filtri_video), invariate se limite è
+    None/0 o il video è già sotto quella soglia. Usata per calcolare il CRF
+    suggerito (crf_suggerito) sulla risoluzione DI OUTPUT: senza questo, un
+    4K rimpicciolito a 1080p riceverebbe il CRF più alto (più compressione)
+    calcolato per il 4K originale, sbagliato per quello che verrà
+    effettivamente codificato. Stessa logica di scala di
+    costruisci_filtri_video, qui duplicata perché lì serve costruire i
+    filtri -vf, qui solo le dimensioni finali."""
+    if not width or not height or not limite:
+        return width, height
+    portrait = height > width
+    if portrait and width > limite:
+        return limite, 2 * round(height * limite / width / 2)
+    if not portrait and height > limite:
+        return 2 * round(width * limite / height / 2), limite
+    return width, height
 
 
 # Estensione del contenitore "nudo" per estrarre una traccia nel suo formato
@@ -2298,9 +2319,10 @@ class App(_BaseTk):
 
         ttk.Separator(r2, orient="vertical").pack(side="left", fill="y", padx=12)
         ttk.Label(r2, text="Risoluzione max:").pack(side="left")
-        self._var_res = tk.StringVar(value="1080")
+        self._var_res = tk.StringVar(value="0")
         for val, lbl in [("1080","1080p"), ("720","720p"), ("0","Nessun limite")]:
-            ttk.Radiobutton(r2, text=lbl, variable=self._var_res, value=val).pack(side="left", padx=6)
+            ttk.Radiobutton(r2, text=lbl, variable=self._var_res, value=val,
+                            command=self._on_res_change).pack(side="left", padx=6)
 
         # Riga 2b: filtri video
         r2b = ttk.Frame(self._frm_video_specific); r2b.pack(fill="x", padx=5, pady=3)
@@ -2886,9 +2908,10 @@ class App(_BaseTk):
                      if s.get("codec_type") == "video"), None)
 
     def _aggiorna_quality_da_risoluzione(self, video: dict):
-        """Propone un CRF di default in base alla risoluzione del file appena
-        selezionato e all'encoder scelto (vedi crf_suggerito), finché
-        l'utente non lo cambia di persona: da quel momento
+        """Propone un CRF di default in base alla risoluzione EFFETTIVA di
+        output (dopo l'eventuale scala di "Risoluzione max", vedi
+        risoluzione_effettiva) e all'encoder scelto (vedi crf_suggerito),
+        finché l'utente non lo cambia di persona: da quel momento
         self._quality_manuale blocca ulteriori aggiornamenti automatici,
         anche selezionando altri file o un altro encoder."""
         if self._quality_manuale or not video:
@@ -2896,6 +2919,8 @@ class App(_BaseTk):
         w, h = video.get("width"), video.get("height")
         if not w or not h:
             return
+        limite = int(self._var_res.get())
+        w, h = risoluzione_effettiva(w, h, limite if limite > 0 else None)
         self._aggiornando_quality_auto = True
         try:
             self._var_quality.set(crf_suggerito(w, h, self._vcodec_id()))
@@ -3244,6 +3269,14 @@ class App(_BaseTk):
         # se non è già stato modificato a mano.
         self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
         self._aggiorna_anteprima()
+
+    def _on_res_change(self):
+        """Cambiare "Risoluzione max" (es. Nessun limite → 1080p) ricalcola
+        il CRF proposto sulla risoluzione EFFETTIVA di output (vedi
+        risoluzione_effettiva/_aggiorna_quality_da_risoluzione), ma solo se
+        non è già stato modificato a mano — stessa logica di _toggle_vcodec
+        per il cambio di encoder."""
+        self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
 
     def _toggle_fps(self):
         self._spin_fps.configure(state="normal" if self._var_limit_fps.get() else "disabled")

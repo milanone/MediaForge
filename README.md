@@ -18,7 +18,7 @@ control the playback side, not a safe default otherwise.
 
 ## Features
 
-- **Encode**: HEVC or AV1, with smart scaling capped at 1080p, aspect ratio/FPS/flip filters,
+- **Encode**: HEVC or AV1, with an optional scaling cap (1080p/720p, off by default), aspect ratio/FPS/flip filters,
   per-stream selection (video/audio/subtitles), trim, and a live command preview — for one file
   with its own settings, or a whole folder of similar files at once
 - Quality (CRF) defaults to a value computed from the selected file's resolution and the chosen
