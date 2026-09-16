@@ -230,23 +230,31 @@ def crf_suggerito(width, height, encoder=None) -> int:
     un video verticale (es. da telefono) è trattato in base alla stessa
     "quantità" di pixel di un equivalente orizzontale.
     encoder, se passato, applica due scarti indipendenti:
-    1) famiglia "av1" (vedi VIDEO_ENCODERS): AV1 è più efficiente di HEVC/
-       H.264 a parità di numero, quindi lo stesso CRF calcolato per HEVC
-       darebbe su AV1 un file più piccolo ma di qualità percepita inferiore
-       — un CRF più basso (qui -4, valore intermedio tra quelli comunemente
-       citati) riporta la qualità percepita allo stesso livello, mantenendo
-       comunque il file più piccolo grazie alla maggiore efficienza del codec;
+    1) famiglia "av1" SOFTWARE (libsvtav1/librav1e, vedi VIDEO_ENCODERS): AV1
+       è più efficiente di HEVC/H.264 a parità di numero, quindi lo stesso
+       CRF calcolato per HEVC darebbe su AV1 un file più piccolo ma di
+       qualità percepita inferiore — un CRF più basso (qui -4, valore
+       intermedio tra quelli comunemente citati) riporta la qualità
+       percepita allo stesso livello, mantenendo comunque il file più
+       piccolo grazie alla maggiore efficienza del codec. Esclude
+       deliberatamente av1_qsv, vedi punto 2;
     2) encoder "hevc_qsv"/"av1_qsv": "-global_quality" su QSV è la modalità
        ICQ di Intel, che condivide la scala numerica del CRF ma non la sua
-       efficienza — verificato su un file reale (Matrix 4K HDR) che lo stesso
-       numero usato per x265 software produce con QSV una compressione molto
-       più aggressiva (0.007 bit/pixel/frame, visibilmente sotto la norma per
-       HEVC 4K). Un CRF più basso (qui -3) compensa avvicinando la qualità
-       percepita a quella che lo stesso numero darebbe in software."""
+       efficienza — verificato su un file reale (Matrix 4K HDR) che lo
+       stesso numero usato per x265 software produce con QSV una
+       compressione molto più aggressiva (0.007 bit/pixel/frame,
+       visibilmente sotto la norma per HEVC 4K). Un CRF più basso (qui -3)
+       compensa avvicinando la qualità percepita a quella che lo stesso
+       numero darebbe in software. Per av1_qsv questo -3 è l'UNICO scarto
+       applicato (niente -4 aggiuntivo per la famiglia av1): fonti esterne
+       e un test reale (CRF 21 a 4K → ~10Mbps, doppio sconto eccessivo)
+       indicano che su hardware Intel l'encoder AV1 non è più efficiente di
+       quello HEVC — anzi, è riportato più scadente — quindi non merita lo
+       sconto aggiuntivo pensato per l'AV1 software."""
     lato_lungo = max(int(width or 0), int(height or 0))
     base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
-    if famiglia == "av1":
+    if famiglia == "av1" and encoder != "av1_qsv":
         base -= 4
     if encoder in ("hevc_qsv", "av1_qsv"):
         base -= 3
