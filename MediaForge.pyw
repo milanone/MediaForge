@@ -207,6 +207,31 @@ def rileva_pixel_non_quadrati(video: dict) -> str:
             "veloce ma è solo un'etichetta: alcuni player la ignorano.")
 
 
+def crf_suggerito(width, height, encoder=None) -> int:
+    """CRF di default in base alla risoluzione (scala 1=max qualità … 51=min,
+    vedi encoder_video_args): più pixel ha il fotogramma, meglio "nascondono"
+    gli artefatti di compressione, quindi conviene un CRF più alto (più
+    compressione) quanto più la risoluzione cresce, e un CRF più basso quanto
+    più è piccola — pratica comune nell'encoding, circa +3 per ogni raddoppio
+    del lato lungo. Ancorato a 25 (il default fisso di questa app finora) a
+    1920px di lato lungo (1080p). Usa il lato lungo (non solo l'altezza) così
+    un video verticale (es. da telefono) è trattato in base alla stessa
+    "quantità" di pixel di un equivalente orizzontale.
+    encoder, se passato, applica uno scarto per la famiglia "av1" (vedi
+    VIDEO_ENCODERS): AV1 è più efficiente di HEVC/H.264 a parità di numero,
+    quindi lo stesso CRF calcolato per HEVC darebbe su AV1 un file più
+    piccolo ma di qualità percepita inferiore — un CRF più basso (qui -4,
+    valore intermedio tra quelli comunemente citati) riporta la qualità
+    percepita allo stesso livello, mantenendo comunque il file più piccolo
+    grazie alla maggiore efficienza del codec."""
+    lato_lungo = max(int(width or 0), int(height or 0))
+    base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
+    famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
+    if famiglia == "av1":
+        base -= 4
+    return max(1, min(51, round(base)))
+
+
 # Estensione del contenitore "nudo" per estrarre una traccia nel suo formato
 # nativo (stream copy, nessuna ricodifica). Dove il codec non ha un contenitore
 # proprio adatto (es. mov_text, PGS/dvd_subtitle), si ripiega su un contenitore
@@ -2181,8 +2206,27 @@ class App(_BaseTk):
         ttk.Label(r1, text="Qualità:").pack(side="left", padx=(8,4))
         self._var_quality = tk.IntVar(value=25)
         self._spin_quality = ttk.Spinbox(r1, from_=1, to=51, textvariable=self._var_quality, width=5)
-        self._spin_quality.pack(side="left", padx=(0,20))
-        Tooltip(self._spin_quality, "1 = qualità massima\n51 = qualità minima")
+        self._spin_quality.pack(side="left", padx=(0,4))
+        Tooltip(self._spin_quality, "1 = qualità massima\n51 = qualità minima\n"
+                "Default proposto in base alla risoluzione del file selezionato "
+                "(più pixel nascondono meglio la compressione): modificalo pure, "
+                "da quel momento resta fisso e non verrà più ricalcolato (usa "
+                "\"↺ Auto\" per riattivare il calcolo automatico).")
+        self._btn_quality_auto = ttk.Button(r1, text="↺ Auto", width=7,
+                                             command=self._riattiva_quality_auto)
+        self._btn_quality_auto.pack(side="left", padx=(0,20))
+        Tooltip(self._btn_quality_auto,
+                "Riattiva il calcolo automatico della qualità in base alla "
+                "risoluzione del file selezionato (disattivato non appena "
+                "modifichi il valore a mano).")
+        # Il default viene ricalcolato automaticamente per risoluzione (vedi
+        # _aggiorna_quality_da_risoluzione) solo finché l'utente non lo tocca
+        # di persona: _aggiornando_quality_auto distingue le due scritture
+        # della stessa IntVar nella stessa trace. Il bottone "↺ Auto" annulla
+        # quel blocco (_riattiva_quality_auto).
+        self._quality_manuale = False
+        self._aggiornando_quality_auto = False
+        self._var_quality.trace_add("write", self._on_quality_var_change)
 
         ttk.Label(r1, text="Formato output:").pack(side="left")
         self._var_ext = tk.StringVar(value="mp4")
@@ -2768,6 +2812,50 @@ class App(_BaseTk):
             self._bitrate_video_cache[key] = bitrate_video_esatto(path, durata_sec)
         return self._bitrate_video_cache[key]
 
+    def _on_quality_var_change(self, *_args):
+        """Trace su self._var_quality: qualunque scrittura che non sia il
+        nostro stesso _aggiorna_quality_da_risoluzione conta come modifica
+        manuale dell'utente, e da quel momento il default automatico per
+        risoluzione smette di essere applicato (vedi _aggiorna_quality_da_risoluzione)."""
+        if not self._aggiornando_quality_auto:
+            self._quality_manuale = True
+
+    def _video_singolo_selezionato(self):
+        """Stream video del file correntemente selezionato, solo se la
+        selezione è singola. None altrimenti (nessuna selezione, selezione
+        multipla, o file senza stream video) — usato per calcolare/ricalcolare
+        il CRF di default (vedi _aggiorna_quality_da_risoluzione)."""
+        sel = self._listbox.curselection()
+        if len(sel) != 1:
+            return None
+        data = self._ottieni_probe(self._all_files[sel[0]])
+        return next((s for s in data.get("streams", [])
+                     if s.get("codec_type") == "video"), None)
+
+    def _aggiorna_quality_da_risoluzione(self, video: dict):
+        """Propone un CRF di default in base alla risoluzione del file appena
+        selezionato e all'encoder scelto (vedi crf_suggerito), finché
+        l'utente non lo cambia di persona: da quel momento
+        self._quality_manuale blocca ulteriori aggiornamenti automatici,
+        anche selezionando altri file o un altro encoder."""
+        if self._quality_manuale or not video:
+            return
+        w, h = video.get("width"), video.get("height")
+        if not w or not h:
+            return
+        self._aggiornando_quality_auto = True
+        try:
+            self._var_quality.set(crf_suggerito(w, h, self._vcodec_id()))
+        finally:
+            self._aggiornando_quality_auto = False
+
+    def _riattiva_quality_auto(self):
+        """Bottone "↺ Auto": annulla il blocco impostato da una modifica
+        manuale e ricalcola subito il default sul file correntemente
+        selezionato (se uno solo, con uno stream video)."""
+        self._quality_manuale = False
+        self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
+
     def _mostra_stream(self, path: Path):
         # Pulisce widget precedenti
         for w in self._frm_streams_inner.winfo_children():
@@ -2800,6 +2888,7 @@ class App(_BaseTk):
             self._lbl_sar_avviso.pack(fill="x", padx=5, pady=(0, 3))
         else:
             self._lbl_sar_avviso.pack_forget()
+        self._aggiorna_quality_da_risoluzione(video)
 
         if not streams:
             return
@@ -3091,6 +3180,10 @@ class App(_BaseTk):
         la_state = ("normal" if encode and self._vcodec_id()
                     not in ("libx265", "libsvtav1", "hevc_videotoolbox") else "disabled")
         self._chk_lookahead.configure(state=la_state)
+        # Cambiare encoder (es. HEVC → AV1) ricalcola il CRF proposto con lo
+        # scarto giusto per la nuova famiglia (vedi crf_suggerito), ma solo
+        # se non è già stato modificato a mano.
+        self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
         self._aggiorna_anteprima()
 
     def _toggle_fps(self):

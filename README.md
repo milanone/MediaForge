@@ -21,6 +21,10 @@ control the playback side, not a safe default otherwise.
 - **Encode**: HEVC or AV1, with smart scaling capped at 1080p, aspect ratio/FPS/flip filters,
   per-stream selection (video/audio/subtitles), trim, and a live command preview — for one file
   with its own settings, or a whole folder of similar files at once
+- Quality (CRF) defaults to a value computed from the selected file's resolution and the chosen
+  encoder — higher resolution and more efficient codecs (AV1) can use a higher CRF for the same
+  perceived quality — instead of one fixed number for every file; stays put once you edit it by
+  hand, with a button to re-enable the automatic default
 - Available encoders are detected automatically at startup by actually probing ffmpeg on the
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)

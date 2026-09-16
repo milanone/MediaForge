@@ -45,6 +45,11 @@ subclass when `tkinterdnd2` is available). Three tabs (`ttk.Notebook`) sharing o
 Batch-converts a folder of video files to HEVC/AV1. Key pieces:
 - `encoder_video_args()` — per-encoder ffmpeg args (QSV/AMF/NVENC each need different rate-control
   flags; VideoToolbox uses an inverted 1-100 quality scale vs. the GUI's CRF-style 1-51)
+- `crf_suggerito()` — default CRF from the selected file's resolution (higher resolution → higher
+  CRF, same perceived quality) and a -4 offset for the AV1 family (more efficient than HEVC/H.264
+  at the same CRF number); applied on file selection and on encoder change via
+  `_aggiorna_quality_da_risoluzione()`, until the user edits the value by hand
+  (`_quality_manuale`) — the "↺ Auto" button re-enables it
 - `costruisci_filtri_video()` — builds the ffmpeg filter chain (scale/aspect-ratio/FPS/flip)
 - `bitrate_video_esatto()` — exact real video bitrate via summing packet sizes from ffprobe
   (`packet=size`), not an estimate from container-level bitrate minus audio (that approach was
