@@ -3482,6 +3482,7 @@ class App(_BaseTk):
 
             self._stop_ev.clear()
             self._active_op = "codifica"
+            self._previeni_sospensione()
             self._btn_start.configure(state="disabled")
             self._btn_stop.configure(state="normal")
             self._lbl_stato.config(text="In corso…")
@@ -3555,6 +3556,7 @@ class App(_BaseTk):
 
             self._stop_ev.clear()
             self._active_op = "codifica"
+            self._previeni_sospensione()
             self._btn_start.configure(state="disabled")
             self._btn_stop.configure(state="normal")
             self._lbl_stato.config(text="In corso…")
@@ -3619,6 +3621,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "codifica"
+        self._previeni_sospensione()
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
         self._lbl_stato.config(text="In corso…")
@@ -3930,6 +3933,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "mux"
+        self._previeni_sospensione()
         self._btn_mux_start.configure(state="disabled")
         self._btn_mux_stop.configure(state="normal")
         self._lbl_mux_stato.config(text="In corso…")
@@ -3981,6 +3985,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "mux"
+        self._previeni_sospensione()
         self._btn_mux_start.configure(state="disabled")
         self._btn_mux_stop.configure(state="normal")
         self._lbl_mux_stato.config(text="In corso…")
@@ -4250,6 +4255,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "capitoli"
+        self._previeni_sospensione()
         self._btn_cap_start.configure(state="disabled")
         self._btn_cap_stop.configure(state="normal")
         self._lbl_cap_stato.config(text="In corso…")
@@ -4274,6 +4280,27 @@ class App(_BaseTk):
                              "Control_L", "Control_R"):
             return None
         return "break"
+
+    def _previeni_sospensione(self):
+        """Impedisce a Windows di sospendere il PC durante un'operazione
+        lunga (encoding/mux/capitoli): il timer di sospensione di Windows si
+        basa solo sull'inattività di tastiera/mouse, non sul carico di CPU/
+        GPU in background — un ffmpeg che lavora per ore senza input
+        dell'utente non la impedisce da sé, e la sospensione a metà rovina
+        il job in corso. Il flag ES_CONTINUOUS rende lo stato persistente
+        (nessuna chiamata periodica di "rinnovo" necessaria) finché non lo
+        si annulla esplicitamente con _ripristina_sospensione."""
+        if IS_WINDOWS:
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+    def _ripristina_sospensione(self):
+        """Ripristina il comportamento normale di sospensione al termine
+        dell'operazione (vedi _previeni_sospensione)."""
+        if IS_WINDOWS:
+            ES_CONTINUOUS = 0x80000000
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
     def _log_clear(self):
         self._log.delete("1.0", "end")
@@ -4302,6 +4329,7 @@ class App(_BaseTk):
                         self._btn_stop.configure(state="disabled")
                         self._lbl_stato.config(text="Completato")
                     self._active_op = None
+                    self._ripristina_sospensione()
                     # tre campanelle di sistema distanziate (cross-platform via Tk)
                     for i in range(3):
                         self.after(i * 250, self.bell)
