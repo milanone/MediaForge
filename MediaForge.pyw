@@ -229,21 +229,25 @@ def crf_suggerito(width, height, encoder=None) -> int:
     1920px di lato lungo (1080p). Usa il lato lungo (non solo l'altezza) così
     un video verticale (es. da telefono) è trattato in base alla stessa
     "quantità" di pixel di un equivalente orizzontale.
-    encoder, se passato, applica un solo scarto: -1 per l'intera famiglia
-    "av1" (hardware o software, vedi VIDEO_ENCODERS), AV1 essendo
-    generalmente considerato un po' più efficiente di HEVC a parità di
-    numero. Nessuna distinzione hardware/software (né per HEVC né per
-    AV1): un tentativo di scarto specifico per hevc_qsv (-3, dedotto da
-    un'unica misurazione su un file 4K HDR particolarmente ostico — grana
-    pesante, HDR, causa anche altri problemi non legati al CRF) non aveva
-    riscontro solido in fonti esterne, che anzi riportano una penalità
-    minima per hevc_qsv su hardware Intel recente: tolto in attesa di dati
-    più affidabili."""
+    encoder, se passato, applica un solo scarto: +1 per l'intera famiglia
+    "av1" (hardware o software, vedi VIDEO_ENCODERS). AV1 è generalmente
+    considerato un po' più efficiente di HEVC, e un codec più efficiente
+    raggiunge la stessa qualità percepita con un CRF NUMERICAMENTE PIÙ ALTO
+    (più compressione) a parità di codec di confronto — non più basso: la
+    scala CRF non è comparabile 1:1 tra codec diversi (es. la community
+    cita approssimativamente SVT-AV1 CRF 30 ≈ x265 CRF 21, il numero AV1
+    più alto per la stessa resa). Nessuna distinzione hardware/software
+    (né per HEVC né per AV1): un tentativo di scarto specifico per
+    hevc_qsv (-3, dedotto da un'unica misurazione su un file 4K HDR
+    particolarmente ostico — grana pesante, HDR, causa anche altri
+    problemi non legati al CRF) non aveva riscontro solido in fonti
+    esterne, che anzi riportano una penalità minima per hevc_qsv su
+    hardware Intel recente: tolto in attesa di dati più affidabili."""
     lato_lungo = max(int(width or 0), int(height or 0))
     base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
     if famiglia == "av1":
-        base -= 1
+        base += 1
     return max(1, min(51, round(base)))
 
 
