@@ -2,7 +2,8 @@
 """
 GUI cross-platform (Windows / macOS / Linux) per conversione video HEVC o AV1
 con encoder hardware selezionabile — Intel QSV, AMD AMF, NVIDIA NVENC, Apple
-VideoToolbox — o software (libx265 / libsvtav1), e scaling intelligente a max 1080p.
+VideoToolbox — o software (libx265 / libsvtav1), con limite di risoluzione opzionale
+(1080p/720p, disattivato di default).
 Gli encoder disponibili vengono rilevati automaticamente da ffmpeg all'avvio,
 così il programma propone quello giusto su ogni macchina (AMF su PC AMD, QSV su
 Intel, VideoToolbox su Mac Apple Silicon…).
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,17 @@ ESTENSIONI_INPUT_AUDIO = ["*.dts", "*.mp3", "*.aac", "*.mka", "*.wav", "*.m4a"]
 AUDIO_ONLY_EXT = {"copy": "mka", "aac": "aac", "ac3": "ac3", "mp3": "mp3"}
 
 TIPO_ICONA = {"video": "🎬", "audio": "🔊", "subtitle": "💬", "data": "📦"}
+
+# Tag statistici che mkvmerge scrive per traccia (BPS, DURATION,
+# NUMBER_OF_FRAMES, NUMBER_OF_BYTES, entrambi anche in versione "-eng"):
+# -map_metadata 0 li copia alla cieca dal sorgente anche quando lo stream
+# viene ricodificato a un peso/bitrate completamente diversi, ingannando
+# MediaInfo e mkvmerge stessi (che senza un BPS esplicito calcolano il
+# bitrate da NUMBER_OF_BYTES/DURATION, tornando comunque al valore stantio
+# del sorgente) — vanno quindi svuotati esplicitamente sugli stream ricodificati.
+STATS_TAGS_MKV = ("BPS", "BPS-eng", "DURATION", "DURATION-eng",
+                  "NUMBER_OF_FRAMES", "NUMBER_OF_FRAMES-eng",
+                  "NUMBER_OF_BYTES", "NUMBER_OF_BYTES-eng")
 
 
 def bitrate_video_esatto(path: Path, durata_sec: float):
@@ -217,19 +230,46 @@ def crf_suggerito(width, height, encoder=None) -> int:
     1920px di lato lungo (1080p). Usa il lato lungo (non solo l'altezza) così
     un video verticale (es. da telefono) è trattato in base alla stessa
     "quantità" di pixel di un equivalente orizzontale.
-    encoder, se passato, applica uno scarto per la famiglia "av1" (vedi
-    VIDEO_ENCODERS): AV1 è più efficiente di HEVC/H.264 a parità di numero,
-    quindi lo stesso CRF calcolato per HEVC darebbe su AV1 un file più
-    piccolo ma di qualità percepita inferiore — un CRF più basso (qui -4,
-    valore intermedio tra quelli comunemente citati) riporta la qualità
-    percepita allo stesso livello, mantenendo comunque il file più piccolo
-    grazie alla maggiore efficienza del codec."""
+    encoder, se passato, applica un solo scarto: +1 per l'intera famiglia
+    "av1" (hardware o software, vedi VIDEO_ENCODERS). AV1 è generalmente
+    considerato un po' più efficiente di HEVC, e un codec più efficiente
+    raggiunge la stessa qualità percepita con un CRF NUMERICAMENTE PIÙ ALTO
+    (più compressione) a parità di codec di confronto — non più basso: la
+    scala CRF non è comparabile 1:1 tra codec diversi (es. la community
+    cita approssimativamente SVT-AV1 CRF 30 ≈ x265 CRF 21, il numero AV1
+    più alto per la stessa resa). Nessuna distinzione hardware/software
+    (né per HEVC né per AV1): un tentativo di scarto specifico per
+    hevc_qsv (-3, dedotto da un'unica misurazione su un file 4K HDR
+    particolarmente ostico — grana pesante, HDR, causa anche altri
+    problemi non legati al CRF) non aveva riscontro solido in fonti
+    esterne, che anzi riportano una penalità minima per hevc_qsv su
+    hardware Intel recente: tolto in attesa di dati più affidabili."""
     lato_lungo = max(int(width or 0), int(height or 0))
     base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
     if famiglia == "av1":
-        base -= 4
+        base += 1
     return max(1, min(51, round(base)))
+
+
+def risoluzione_effettiva(width, height, limite) -> tuple:
+    """Dimensioni EFFETTIVE del video dopo l'eventuale scala a "Risoluzione
+    max" (limite_res, vedi costruisci_filtri_video), invariate se limite è
+    None/0 o il video è già sotto quella soglia. Usata per calcolare il CRF
+    suggerito (crf_suggerito) sulla risoluzione DI OUTPUT: senza questo, un
+    4K rimpicciolito a 1080p riceverebbe il CRF più alto (più compressione)
+    calcolato per il 4K originale, sbagliato per quello che verrà
+    effettivamente codificato. Stessa logica di scala di
+    costruisci_filtri_video, qui duplicata perché lì serve costruire i
+    filtri -vf, qui solo le dimensioni finali."""
+    if not width or not height or not limite:
+        return width, height
+    portrait = height > width
+    if portrait and width > limite:
+        return limite, 2 * round(height * limite / width / 2)
+    if not portrait and height > limite:
+        return 2 * round(width * limite / height / 2), limite
+    return width, height
 
 
 # Estensione del contenitore "nudo" per estrarre una traccia nel suo formato
@@ -625,23 +665,33 @@ def _build_audio_cmd(src: Path, dst: Path, opts: dict, streams: list) -> list:
     if opts.get("stream_map"):
         # Selezione manuale (file singolo): tiene solo gli indici che sono audio,
         # anche se in stream_map fossero rimasti indici video/sottotitoli spuntati
+        n_audio = 0
         for idx in opts["stream_map"]:
             if idx < len(streams) and streams[idx].get("codec_type") == "audio":
                 cmd += ["-map", f"0:{idx}"]
+                n_audio += 1
     else:
         cmd += ["-map", "0:a"]
+        n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
 
     cmd += ["-map_metadata", "0", "-vn"]
 
     audio = opts.get("audio", "copy")
     if audio == "copy":
         cmd += ["-c:a", "copy"]
-    elif audio == "aac":
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    elif audio == "ac3":
-        cmd += ["-c:a", "ac3", "-b:a", "384k"]
-    elif audio == "mp3":
-        cmd += ["-c:a", "mp3", "-b:a", "128k", "-ar", "44100"]
+    else:
+        if audio == "aac":
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+        elif audio == "ac3":
+            cmd += ["-c:a", "ac3", "-b:a", "384k"]
+        elif audio == "mp3":
+            cmd += ["-c:a", "mp3", "-b:a", "128k", "-ar", "44100"]
+        # Stesso problema di build_ffmpeg_cmd: -map_metadata 0 copierebbe
+        # alla cieca i tag statistici mkvmerge del sorgente (STATS_TAGS_MKV)
+        # anche col nuovo bitrate fisso scelto qui.
+        for i in range(n_audio):
+            for tag in STATS_TAGS_MKV:
+                cmd += [f"-metadata:s:a:{i}", f"{tag}="]
 
     cmd.append(str(dst))
     return cmd
@@ -885,17 +935,21 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
 
     # --- Selezione stream ---
     subs = opts.get("subs", "copy")
+    # "mux" (vedi build_postmux_sottotitoli_cmd/converti_file): i sottotitoli
+    # vanno esclusi anche qui dalla codifica principale, come "no" — vengono
+    # aggiunti dopo con un remux separato, non durante questo passaggio.
+    escludi_subs = subs in ("no", "mux")
     if opts.get("stream_map"):
         # Modalità file singolo: stream selezionati manualmente
         for idx in opts["stream_map"]:
             # Se sottotitoli esclusi, salta gli stream subtitle
-            if subs == "no" and idx < len(streams) and streams[idx].get("codec_type") == "subtitle":
+            if escludi_subs and idx < len(streams) and streams[idx].get("codec_type") == "subtitle":
                 continue
             cmd += ["-map", f"0:{idx}"]
     else:
         # Batch: tutti gli stream
         cmd += ["-map", "0"]
-        if subs == "no":
+        if escludi_subs:
             cmd += ["-map", "-0:s"]  # esclude tutti i sottotitoli
 
     cmd += ["-map_metadata", "0"]
@@ -915,16 +969,13 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         _, famiglia = VIDEO_ENCODERS.get(opts.get("vcodec"), (None, "hevc"))
         video_is_hevc = famiglia == "hevc"
         if video is not None:
-            # -map_metadata 0 copia alla cieca il tag statistico "BPS"/
-            # "BPS-eng" del sorgente anche quando il video viene RICODIFICATO
-            # a un bitrate completamente diverso: verificato con un file
-            # reale che il tag resta quello vecchio (es. 2763kbps) anche se
-            # il file finale pesa una frazione e il bitrate vero è crollato —
-            # ingannando MediaInfo e qualunque altro strumento, questa stessa
-            # app inclusa (vedi descrivi_stream). Lo svuotiamo esplicitamente
-            # sullo stream video di output (":v:0", quasi sempre l'unico:
-            # più tracce video non sono un caso gestito da questa app).
-            cmd += ["-metadata:s:v:0", "BPS=", "-metadata:s:v:0", "BPS-eng="]
+            # -map_metadata 0 copia alla cieca i tag statistici mkvmerge del
+            # sorgente (vedi STATS_TAGS_MKV) anche quando il video viene
+            # RICODIFICATO a un peso/bitrate completamente diversi: li
+            # svuotiamo sullo stream video di output (":v:0", quasi sempre
+            # l'unico: più tracce video non sono un caso gestito da questa app).
+            for tag in STATS_TAGS_MKV:
+                cmd += ["-metadata:s:v:0", f"{tag}="]
 
     if video_is_hevc and opts.get("output_ext") == "mp4":
         # ffmpeg marca l'HEVC in MP4 come "hev1" di default: QuickTime/iOS/macOS
@@ -942,21 +993,24 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             cmd += ["-c:a", "ac3", "-b:a", "384k"]
         elif opts["audio"] == "mp3":
             cmd += ["-c:a", "mp3", "-b:a", "128k", "-ar", "44100"]
-        # Stesso problema del video qui sopra: pulisce il tag BPS/BPS-eng
-        # ereditato dal sorgente su ogni stream audio effettivamente
-        # ricodificato (non più valido col nuovo bitrate fisso scelto).
+        # Stesso problema del video qui sopra: pulisce i tag statistici
+        # mkvmerge (STATS_TAGS_MKV) ereditati dal sorgente su ogni stream
+        # audio effettivamente ricodificato (non più validi col nuovo
+        # bitrate fisso scelto).
         if opts.get("stream_map"):
             n_audio = sum(1 for i in opts["stream_map"]
                           if i < len(streams) and streams[i].get("codec_type") == "audio")
         else:
             n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
         for i in range(n_audio):
-            cmd += [f"-metadata:s:a:{i}", "BPS=", f"-metadata:s:a:{i}", "BPS-eng="]
+            for tag in STATS_TAGS_MKV:
+                cmd += [f"-metadata:s:a:{i}", f"{tag}="]
 
     # --- Sottotitoli ---
     subs = opts.get("subs", "copy")
-    if subs == "no":
-        # Rimuove eventuali stream sottotitoli già mappati
+    if subs in ("no", "mux"):
+        # "no": esclusi del tutto. "mux": esclusi qui, aggiunti dopo con un
+        # remux separato (vedi escludi_subs sopra).
         pass
     else:
         if opts.get("stream_map"):
@@ -992,6 +1046,54 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
     return cmd
 
 
+def build_postmux_sottotitoli_cmd(encoded_path: Path, src: Path, src_data: dict,
+                                   opts: dict, dst: Path, warnings: list = None) -> list:
+    """Aggiunge (remux puro, "-c copy", nessuna ricodifica) i sottotitoli del
+    sorgente originale a un file già codificato SENZA sottotitoli — secondo
+    passaggio della modalità "Muxa a fine codifica" (vedi build_ffmpeg_cmd,
+    subs=="mux"): input 0 è il file già codificato (video/audio), input 1 è
+    il sorgente originale, da cui si rimappano solo gli stream sottotitoli
+    (per indice assoluto, stesso stream_map usato — o l'intera lista, in
+    batch — nella codifica principale). Usato sia dalla scelta manuale
+    dell'utente sia dal fallback automatico dopo uno stallo (vedi
+    converti_file/esegui_postmux_sottotitoli): tenere i sottotitoli fuori dal
+    passaggio di codifica vero e proprio, più lento e più esposto a stalli su
+    timestamp corrotti, e aggiungerli qui con un remux separato — più veloce
+    e più semplice perché non deve interlacciare anche video/audio da
+    ricodificare."""
+    streams = src_data.get("streams", [])
+    if opts.get("stream_map"):
+        sub_idx = [i for i in opts["stream_map"]
+                   if i < len(streams) and streams[i].get("codec_type") == "subtitle"]
+    else:
+        sub_idx = [i for i, s in enumerate(streams) if s.get("codec_type") == "subtitle"]
+
+    cmd = ["ffmpeg", "-y", "-i", str(encoded_path), "-i", str(src),
+           "-map", "0", "-map_metadata", "0"]
+    for i in sub_idx:
+        cmd += ["-map", f"1:{i}"]
+    cmd += ["-c", "copy"]
+
+    if sub_idx:
+        sub_codec = "copy"
+        if opts.get("output_ext") == "mp4":
+            # Stesso problema/soluzione di build_ffmpeg_cmd: mp4 accetta solo
+            # sottotitoli mov_text.
+            incompatibili = {streams[i].get("codec_name") for i in sub_idx} - {"mov_text"}
+            if incompatibili:
+                sub_codec = "mov_text"
+                if warnings is not None:
+                    nomi = ", ".join(sorted(incompatibili))
+                    warnings.append(
+                        f"Sottotitoli {nomi} non supportati dal contenitore mp4: "
+                        "conversione forzata in mov_text (perde lo styling avanzato "
+                        "ASS/SSA, mantiene testo e timing).")
+        cmd += ["-c:s", sub_codec]
+
+    cmd.append(str(dst))
+    return cmd
+
+
 def build_fixtag_cmd(src: Path, dst: Path) -> list:
     """Remux puro per correggere il tag del codec HEVC in mp4 già codificati
     (ffmpeg scrive 'hev1', QuickTime/iOS/macOS richiedono 'hvc1'): tutti gli
@@ -1008,11 +1110,19 @@ def build_fixbitrate_cmd(src: Path, dst: Path, bitrate_video: int) -> list:
     valore REALE appena calcolato (bitrate_video_esatto), senza ricodificare
     nulla (vedi fix_bitrate_tag per il resto: data file preservata).
     bitrate_video None/0 -> il tag viene solo svuotato (nessun valore
-    attendibile da scrivere)."""
+    attendibile da scrivere). Svuota anche gli altri tag statistici mkvmerge
+    (STATS_TAGS_MKV) rimasti stantii sul file da correggere: -map_metadata 0
+    li copierebbe altrimenti tali e quali da src a dst, e con BPS ormai
+    corretto MediaInfo/mkvmerge tornerebbero comunque a calcolare il bitrate
+    da NUMBER_OF_BYTES/DURATION stantii (stesso bug di build_ffmpeg_cmd)."""
     valore = str(bitrate_video) if bitrate_video else ""
-    return ["ffmpeg", "-y", "-i", str(src), "-map", "0", "-map_metadata", "0", "-c", "copy",
-            "-metadata:s:v:0", f"BPS={valore}", "-metadata:s:v:0", f"BPS-eng={valore}",
-            str(dst)]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-map", "0", "-map_metadata", "0", "-c", "copy",
+           "-metadata:s:v:0", f"BPS={valore}", "-metadata:s:v:0", f"BPS-eng={valore}"]
+    for tag in STATS_TAGS_MKV:
+        if tag not in ("BPS", "BPS-eng"):
+            cmd += ["-metadata:s:v:0", f"{tag}="]
+    cmd.append(str(dst))
+    return cmd
 
 
 def build_mux_cmd(src: Path, src_data: dict, stream_map: list,
@@ -1198,7 +1308,104 @@ def applica_timestamp(src: Path, dst: Path, modalita: str, data: dict, log_q: qu
         log_q.put(("detail", "  Avviso: impossibile impostare la data del file"))
 
 
-def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.Event) -> bool:
+def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading.Event,
+                                timeout_stallo: float = 5.0):
+    """Lancia ffmpeg, inoltra al log le righe di progresso (frame/fps/time/
+    speed) e di dettaglio, e ne segue l'esito. Oltre all'interruzione manuale
+    (stop_ev) e al codice di uscita, rileva uno STALLO: se il valore di
+    "time=" non cambia per timeout_stallo secondi, considera il processo
+    bloccato e lo termina — non è un errore ffmpeg con un codice di uscita,
+    il processo resta vivo (a volte continuando anche a stampare righe di
+    progresso, con valori fermi o incoerenti) ma non avanza più. Il caso
+    tipico è un flusso sottotitoli col timestamp corrotto che manda in crisi
+    il buffer di interleaving del muxer (vedi converti_file, che in quel caso
+    riprova escludendo i sottotitoli).
+    La lettura dello stdout avviene in un thread separato: leggere riga per
+    riga bloccherebbe altrimenti il controllo periodico dello stallo proprio
+    nel caso che deve rilevare, quello in cui non arriva più nessuna riga.
+    Ritorna (esito, returncode) con esito in "ok"/"interrotto"/"stallo"/"errore"."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+
+    righe_q = queue.Queue()
+
+    def leggi_stdout():
+        for line in proc.stdout:
+            righe_q.put(line.rstrip())
+        righe_q.put(None)  # sentinella: stdout chiuso, il processo ha finito
+
+    threading.Thread(target=leggi_stdout, daemon=True).start()
+
+    ultimo_progresso = time.monotonic()
+    ultimo_valore_time = None
+    esito = "ok"
+    while True:
+        if stop_ev.is_set():
+            # Termina subito il processo ffmpeg in corso, non solo la coda dei
+            # file successivi: prima "Interrompi" agiva solo tra un file e
+            # l'altro, lasciando proseguire indisturbata la codifica già
+            # avviata (il caso più comune con un solo film selezionato).
+            proc.terminate()
+            esito = "interrotto"
+            break
+        # Controllato ad OGNI giro, non solo quando la coda resta vuota: uno
+        # stallo reale può comunque continuare a produrre un flusso fitto di
+        # righe non di progresso (osservato: "[matroska @ ...] Starting new
+        # cluster due to timestamp" ripetuta in loop stretto per via del
+        # timestamp corrotto) — in quel caso la coda non resta MAI vuota per
+        # un secondo pieno, quindi il controllo dentro "except queue.Empty"
+        # da solo non scatterebbe mai, anche con "time=" fermo da minuti.
+        if time.monotonic() - ultimo_progresso > timeout_stallo:
+            proc.terminate()
+            esito = "stallo"
+            break
+        try:
+            line = righe_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if line is None:
+            break
+        m = re.search(r"time=(\S+)", line)
+        if m and m.group(1) != ultimo_valore_time:
+            ultimo_valore_time = m.group(1)
+            ultimo_progresso = time.monotonic()
+        if any(k in line for k in ("frame=", "fps=", "time=", "speed=")):
+            log_q.put(("progress", line))
+        elif line:
+            log_q.put(("detail", "  " + line))
+
+    proc.wait()
+    if esito == "ok" and proc.returncode != 0:
+        esito = "errore"
+    return esito, proc.returncode
+
+
+def esegui_postmux_sottotitoli(src: Path, encoded_path: Path, data: dict, opts: dict,
+                                dst: Path, log_q: queue.Queue) -> bool:
+    """Esegue build_postmux_sottotitoli_cmd (remux puro, aggiunge i
+    sottotitoli originali a un file già codificato senza) e ne riporta
+    l'esito nel log. In caso di errore non lascia un dst parziale."""
+    warnings = []
+    cmd = build_postmux_sottotitoli_cmd(encoded_path, src, data, opts, dst, warnings)
+    for w in warnings:
+        log_q.put(("warning", f"  ⚠ {w}"))
+    log_q.put(("cmd", "  $ (aggiunta sottotitoli) " + " ".join(cmd)))
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        stdin=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode != 0:
+        log_q.put(("error", f"  ✗ Errore aggiungendo i sottotitoli (codice {r.returncode})"))
+        dst.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.Event,
+                   timeout_stallo: float = 5.0) -> bool:
     ext = opts["output_ext"]
     dst = src.parent / f"{src.stem}_enc.{ext}"
 
@@ -1206,66 +1413,87 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
 
     data = ffprobe_json(src)
 
+    # "mux" (scelta manuale, vedi build_ffmpeg_cmd/build_postmux_sottotitoli_cmd):
+    # i sottotitoli sono sempre esclusi dalla codifica principale e aggiunti
+    # dopo con un remux separato. Lo stesso scatta DA SOLO (posticipa_subs
+    # passa a True più sotto) se il watchdog rileva uno stallo con
+    # "copia"/"converti in SRT" — tipicamente un flusso sottotitoli dal
+    # timestamp corrotto che blocca il buffer di interleaving del muxer.
+    subs_scelti = opts.get("subs", "copy")
+    posticipa_subs = subs_scelti == "mux"
+    subs_gia_riprovati_per_stallo = False
+
     # Se l'encoder scelto supporta la decodifica hardware (usa_hwaccel_decode),
     # il primo tentativo la usa; se fallisce si riprova UNA volta in
     # decodifica software invece di considerare il file irrecuperabile — non
     # tutti i codec/sorgenti sono decodificabili in hardware (verificato che
     # perfino "-hwaccel qsv" fallisce in decodifica su alcuni file/driver, pur
     # con l'encoder qsv scelto perfettamente funzionante).
-    tentativi_hwaccel = [True, False] if usa_hwaccel_decode(opts.get("vcodec")) else [False]
+    hwaccel = usa_hwaccel_decode(opts.get("vcodec"))
 
-    for tentativo, hwaccel in enumerate(tentativi_hwaccel):
+    while True:
+        # dst_encode è il bersaglio REALE di questo tentativo di codifica:
+        # se i sottotitoli sono posticipati, si codifica prima video/audio in
+        # un file temporaneo nascosto, poi si aggiungono i sottotitoli con un
+        # remux separato che produce dst (vedi più sotto).
+        opts_encode = dict(opts, subs="no") if posticipa_subs else opts
+        dst_encode = (src.with_name(f".{src.stem}.novosub{dst.suffix}")
+                      if posticipa_subs else dst)
         try:
             warnings = []
-            cmd = build_ffmpeg_cmd(src, dst, opts, data, warnings, hwaccel_decode=hwaccel)
+            cmd = build_ffmpeg_cmd(src, dst_encode, opts_encode, data, warnings,
+                                    hwaccel_decode=hwaccel)
             for w in warnings:
                 log_q.put(("warning", f"  ⚠ {w}"))
             log_q.put(("cmd", "  $ " + " ".join(cmd)))
 
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-            interrotto = False
-            for line in proc.stdout:
-                if stop_ev.is_set():
-                    # Termina subito il processo ffmpeg in corso, non solo la coda
-                    # dei file successivi: prima "Interrompi" agiva solo tra un
-                    # file e l'altro, lasciando proseguire indisturbata la codifica
-                    # già avviata (il caso più comune con un solo film selezionato).
-                    interrotto = True
-                    proc.terminate()
-                    break
-                line = line.rstrip()
-                if any(k in line for k in ("frame=", "fps=", "time=", "speed=")):
-                    log_q.put(("progress", line))
-                elif line:
-                    log_q.put(("detail", "  " + line))
-            proc.wait()
+            esito, returncode = esegui_ffmpeg_con_watchdog(
+                cmd, log_q, stop_ev, timeout_stallo=timeout_stallo)
 
-            if interrotto:
+            if esito == "interrotto":
                 log_q.put(("detail", "  Interrotto dall'utente."))
-                dst.unlink(missing_ok=True)  # rimuove l'output parziale/incompleto
+                dst_encode.unlink(missing_ok=True)  # rimuove l'output parziale/incompleto
                 return False
 
-            if proc.returncode != 0:
-                ultimo_tentativo = tentativo == len(tentativi_hwaccel) - 1
-                if not ultimo_tentativo:
+            if esito == "stallo":
+                if not posticipa_subs and not subs_gia_riprovati_per_stallo and subs_scelti != "no":
+                    log_q.put(("warning",
+                        f"  ⚠ Codifica bloccata da oltre {timeout_stallo:.0f}s (probabile "
+                        "problema di timestamp nei sottotitoli): riprovo escludendoli, "
+                        "verranno riaggiunti con un remux separato a fine codifica."))
+                    dst_encode.unlink(missing_ok=True)
+                    posticipa_subs = True
+                    subs_gia_riprovati_per_stallo = True
+                    continue  # stesso hwaccel, ora senza sottotitoli
+                log_q.put(("error",
+                    f"  ✗ Codifica bloccata da oltre {timeout_stallo:.0f}s (stallo), "
+                    "anche senza sottotitoli."))
+                dst_encode.unlink(missing_ok=True)
+                return False
+
+            if esito == "errore":
+                if hwaccel:
                     log_q.put(("warning",
                         "  ⚠ Decodifica hardware non riuscita per questo file: ripiego "
                         "su decodifica software e riprovo."))
-                    dst.unlink(missing_ok=True)
+                    dst_encode.unlink(missing_ok=True)
+                    hwaccel = False
                     continue
-                log_q.put(("error", f"  ✗ Errore ffmpeg (codice {proc.returncode})"))
+                log_q.put(("error", f"  ✗ Errore ffmpeg (codice {returncode})"))
                 # Rimuove l'eventuale file di destinazione (parziale, o un
                 # residuo di un tentativo precedente): altrimenti, dopo un
                 # fallimento, quel file resterebbe lì scambiabile per un
                 # risultato riuscito — l'esistenza di dst deve sempre voler
                 # dire "conversione riuscita", mai "c'era già qualcosa".
-                dst.unlink(missing_ok=True)
+                dst_encode.unlink(missing_ok=True)
                 return False
+
+            # esito == "ok"
+            if posticipa_subs:
+                ok_mux = esegui_postmux_sottotitoli(src, dst_encode, data, opts, dst, log_q)
+                dst_encode.unlink(missing_ok=True)
+                if not ok_mux:
+                    return False
 
             applica_timestamp(src, dst, opts["timestamp"], data, log_q)
 
@@ -1277,10 +1505,9 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
 
         except Exception as e:
             log_q.put(("error", f"  ✗ Eccezione: {e}"))
+            dst_encode.unlink(missing_ok=True)
             dst.unlink(missing_ok=True)
             return False
-
-    return False  # non dovrebbe mai arrivarci: il loop ritorna sempre prima
 
 
 def worker(files: list, opts: dict, log_q: queue.Queue, stop_ev: threading.Event):
@@ -2261,9 +2488,10 @@ class App(_BaseTk):
 
         ttk.Separator(r2, orient="vertical").pack(side="left", fill="y", padx=12)
         ttk.Label(r2, text="Risoluzione max:").pack(side="left")
-        self._var_res = tk.StringVar(value="1080")
+        self._var_res = tk.StringVar(value="0")
         for val, lbl in [("1080","1080p"), ("720","720p"), ("0","Nessun limite")]:
-            ttk.Radiobutton(r2, text=lbl, variable=self._var_res, value=val).pack(side="left", padx=6)
+            ttk.Radiobutton(r2, text=lbl, variable=self._var_res, value=val,
+                            command=self._on_res_change).pack(side="left", padx=6)
 
         # Riga 2b: filtri video
         r2b = ttk.Frame(self._frm_video_specific); r2b.pack(fill="x", padx=5, pady=3)
@@ -2330,8 +2558,16 @@ class App(_BaseTk):
         self._frm_subs = ttk.Frame(frm_opt); self._frm_subs.pack(fill="x", padx=5, pady=3)
         ttk.Label(self._frm_subs, text="Sottotitoli:").pack(side="left")
         self._var_subs = tk.StringVar(value="copy")
-        for val, lbl in [("copy","Copia"), ("srt","Converti in SRT"), ("no","Escludi")]:
+        for val, lbl in [("copy","Copia"), ("srt","Converti in SRT"), ("no","Escludi"),
+                          ("mux","Muxa a fine codifica")]:
             ttk.Radiobutton(self._frm_subs, text=lbl, variable=self._var_subs, value=val).pack(side="left", padx=6)
+        Tooltip(self._frm_subs,
+                "\"Muxa a fine codifica\": i sottotitoli vengono esclusi dalla "
+                "codifica principale e aggiunti dopo con un remux separato "
+                "(nessuna perdita, solo un passaggio extra) — utile per "
+                "bypassare a mano un file che si blocca in codifica per "
+                "colpa dei sottotitoli (stesso rimedio che scatta da solo se "
+                "il programma rileva uno stallo).")
 
         # Riga 4: timestamp
         r4 = ttk.Frame(frm_opt); r4.pack(fill="x", padx=5, pady=3)
@@ -2589,6 +2825,10 @@ class App(_BaseTk):
             frm_log, wrap="word", font=mono, height=10,
             background="#1e1e1e", foreground="#d4d4d4")
         self._log.pack(fill="both", expand=True, padx=5, pady=5)
+        # (indice_inizio, indice_fine) dell'eventuale riga di progresso "viva"
+        # attualmente mostrata in fondo al log, o None — vedi
+        # _sostituisci_riga_progresso/_dimentica_riga_progresso.
+        self._progresso_range = None
         # Il widget resta in stato "normal" (non "disabled") così il testo si
         # può selezionare e copiare col mouse/Ctrl+C; questo binding blocca
         # solo digitazione/incolla, lasciando passare navigazione e Ctrl+C/A.
@@ -2849,9 +3089,10 @@ class App(_BaseTk):
                      if s.get("codec_type") == "video"), None)
 
     def _aggiorna_quality_da_risoluzione(self, video: dict):
-        """Propone un CRF di default in base alla risoluzione del file appena
-        selezionato e all'encoder scelto (vedi crf_suggerito), finché
-        l'utente non lo cambia di persona: da quel momento
+        """Propone un CRF di default in base alla risoluzione EFFETTIVA di
+        output (dopo l'eventuale scala di "Risoluzione max", vedi
+        risoluzione_effettiva) e all'encoder scelto (vedi crf_suggerito),
+        finché l'utente non lo cambia di persona: da quel momento
         self._quality_manuale blocca ulteriori aggiornamenti automatici,
         anche selezionando altri file o un altro encoder."""
         if self._quality_manuale or not video:
@@ -2859,6 +3100,8 @@ class App(_BaseTk):
         w, h = video.get("width"), video.get("height")
         if not w or not h:
             return
+        limite = int(self._var_res.get())
+        w, h = risoluzione_effettiva(w, h, limite if limite > 0 else None)
         self._aggiornando_quality_auto = True
         try:
             self._var_quality.set(crf_suggerito(w, h, self._vcodec_id()))
@@ -2991,22 +3234,28 @@ class App(_BaseTk):
             return
 
         if dichiarato is None:
-            messagebox.showinfo("Verifica bitrate",
-                f"Nessun bitrate dichiarato nel file da confrontare.\n"
-                f"Bitrate reale: {reale // 1000}kbps.")
-            return
-
-        if not bitrate_scarto_reale(dichiarato, reale):
+            # Nessun BPS da confrontare, ma il file potrebbe avere comunque
+            # tag statistici stantii (NUMBER_OF_BYTES/DURATION, vedi
+            # STATS_TAGS_MKV) che ingannano MediaInfo pur senza un BPS
+            # esplicito: proponiamo la stessa correzione del caso "scarto
+            # rilevato" invece di limitarci a informare e non fare nulla.
+            domanda = (f"Nessun bitrate dichiarato nel file da confrontare.\n"
+                       f"Bitrate reale: {reale // 1000}kbps.\n\n"
+                       "Il file potrebbe comunque avere tag statistici stantii "
+                       "(es. NUMBER_OF_BYTES) che ingannano MediaInfo: scrivere "
+                       "il bitrate reale nel tag e pulirli (nessuna ricodifica)?")
+        elif not bitrate_scarto_reale(dichiarato, reale):
             messagebox.showinfo("Verifica bitrate",
                 f"Il bitrate dichiarato è corretto.\n\n"
                 f"Dichiarato: {dichiarato // 1000}kbps  —  Reale: {reale // 1000}kbps.")
             return
+        else:
+            domanda = (f"Il bitrate dichiarato ({dichiarato // 1000}kbps) NON corrisponde a "
+                       f"quello reale ({reale // 1000}kbps) — probabilmente un tag rimasto da "
+                       "una ricodifica precedente.\n\nCorreggerlo subito su questo file "
+                       "(nessuna ricodifica, solo il tag)?")
 
-        if not messagebox.askyesno("Verifica bitrate",
-                f"Il bitrate dichiarato ({dichiarato // 1000}kbps) NON corrisponde a "
-                f"quello reale ({reale // 1000}kbps) — probabilmente un tag rimasto da "
-                "una ricodifica precedente.\n\nCorreggerlo subito su questo file "
-                "(nessuna ricodifica, solo il tag)?"):
+        if not messagebox.askyesno("Verifica bitrate", domanda):
             return
 
         log_q = queue.Queue()
@@ -3201,6 +3450,14 @@ class App(_BaseTk):
         # se non è già stato modificato a mano.
         self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
         self._aggiorna_anteprima()
+
+    def _on_res_change(self):
+        """Cambiare "Risoluzione max" (es. Nessun limite → 1080p) ricalcola
+        il CRF proposto sulla risoluzione EFFETTIVA di output (vedi
+        risoluzione_effettiva/_aggiorna_quality_da_risoluzione), ma solo se
+        non è già stato modificato a mano — stessa logica di _toggle_vcodec
+        per il cambio di encoder."""
+        self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
 
     def _toggle_fps(self):
         self._spin_fps.configure(state="normal" if self._var_limit_fps.get() else "disabled")
@@ -3439,6 +3696,7 @@ class App(_BaseTk):
 
             self._stop_ev.clear()
             self._active_op = "codifica"
+            self._previeni_sospensione()
             self._btn_start.configure(state="disabled")
             self._btn_stop.configure(state="normal")
             self._lbl_stato.config(text="In corso…")
@@ -3477,7 +3735,14 @@ class App(_BaseTk):
                 if reale is None:
                     righe.append(f"?  {f.name} — bitrate reale non calcolabile")
                 elif dichiarato is None:
-                    righe.append(f"?  {f.name} — nessun valore dichiarato (reale: {reale // 1000}kbps)")
+                    # Nessun BPS da confrontare, ma potrebbero restare tag
+                    # statistici stantii (NUMBER_OF_BYTES/DURATION, vedi
+                    # STATS_TAGS_MKV) che ingannano MediaInfo lo stesso: va
+                    # corretto anche in questo caso, scrivendo il BPS reale
+                    # appena calcolato e pulendo quei tag (fix_bitrate_tag).
+                    righe.append(f"⚠  {f.name} — nessun valore dichiarato "
+                                  f"(reale: {reale // 1000}kbps)")
+                    da_correggere.append((f, reale))
                 elif not bitrate_scarto_reale(dichiarato, reale):
                     righe.append(f"✓  {f.name} — già corretto ({dichiarato // 1000}kbps)")
                 else:
@@ -3505,6 +3770,7 @@ class App(_BaseTk):
 
             self._stop_ev.clear()
             self._active_op = "codifica"
+            self._previeni_sospensione()
             self._btn_start.configure(state="disabled")
             self._btn_stop.configure(state="normal")
             self._lbl_stato.config(text="In corso…")
@@ -3569,6 +3835,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "codifica"
+        self._previeni_sospensione()
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
         self._lbl_stato.config(text="In corso…")
@@ -3880,6 +4147,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "mux"
+        self._previeni_sospensione()
         self._btn_mux_start.configure(state="disabled")
         self._btn_mux_stop.configure(state="normal")
         self._lbl_mux_stato.config(text="In corso…")
@@ -3931,6 +4199,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "mux"
+        self._previeni_sospensione()
         self._btn_mux_start.configure(state="disabled")
         self._btn_mux_stop.configure(state="normal")
         self._lbl_mux_stato.config(text="In corso…")
@@ -4200,6 +4469,7 @@ class App(_BaseTk):
 
         self._stop_ev.clear()
         self._active_op = "capitoli"
+        self._previeni_sospensione()
         self._btn_cap_start.configure(state="disabled")
         self._btn_cap_stop.configure(state="normal")
         self._lbl_cap_stato.config(text="In corso…")
@@ -4225,12 +4495,77 @@ class App(_BaseTk):
             return None
         return "break"
 
+    def _previeni_sospensione(self):
+        """Impedisce a Windows di sospendere il PC durante un'operazione
+        lunga (encoding/mux/capitoli): il timer di sospensione di Windows si
+        basa solo sull'inattività di tastiera/mouse, non sul carico di CPU/
+        GPU in background — un ffmpeg che lavora per ore senza input
+        dell'utente non la impedisce da sé, e la sospensione a metà rovina
+        il job in corso. Il flag ES_CONTINUOUS rende lo stato persistente
+        (nessuna chiamata periodica di "rinnovo" necessaria) finché non lo
+        si annulla esplicitamente con _ripristina_sospensione."""
+        if IS_WINDOWS:
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+    def _ripristina_sospensione(self):
+        """Ripristina il comportamento normale di sospensione al termine
+        dell'operazione (vedi _previeni_sospensione)."""
+        if IS_WINDOWS:
+            ES_CONTINUOUS = 0x80000000
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
     def _log_clear(self):
         self._log.delete("1.0", "end")
+        self._progresso_range = None
+
+    def _log_in_fondo(self) -> bool:
+        """True se la vista del log è già ancorata in fondo (non scrollata
+        manualmente più in alto) — usato per decidere se seguire
+        automaticamente il nuovo testo o lasciare la vista dov'è."""
+        return self._log.yview()[1] >= 0.999
+
+    def _dimentica_riga_progresso(self):
+        """Smette di tracciare la riga di progresso "viva" (vedi _poll_log,
+        tag=="progress") SENZA cancellarla: da qui in poi resta nel log come
+        una riga normale, permanente. Va chiamato PRIMA di scrivere
+        qualunque ALTRA riga (vedi _log_write): altrimenti quella riga
+        smetterebbe di essere l'ultima del widget, e il prossimo
+        aggiornamento di progresso — pensato per sostituire SOLO la vecchia
+        riga di progresso — o la cancellerebbe insieme a lei (perdendola),
+        o (con la versione precedente di questa logica, che cancellava
+        sempre "le ultime due righe" alla cieca) cancellava per sbaglio
+        proprio la riga appena scritta al posto suo: bug osservato, una riga
+        informativa ffmpeg intercalata tra due aggiornamenti di progresso
+        spariva, mentre la vecchia riga di progresso restava bloccata per
+        sempre e le righe successive si accumulavano come righe nuove
+        invece di sostituirla — dando l'impressione di uno stallo/numeri
+        incoerenti anche a codifica perfettamente in corso."""
+        self._progresso_range = None
 
     def _log_write(self, tag: str, text: str):
+        # Segue automaticamente in fondo solo se l'utente non ha scrollato
+        # via a mano e non sta selezionando del testo — altrimenti "see" lo
+        # strapperebbe via dalla riga che sta leggendo/selezionando ad ogni
+        # nuova riga di log (impossibile copiare nulla durante una
+        # conversione in corso, dove le righe arrivano di continuo).
+        segui = self._log_in_fondo() and not self._log.tag_ranges("sel")
+        self._dimentica_riga_progresso()
         self._log.insert("end", text + "\n", tag)
-        self._log.see("end")
+        if segui:
+            self._log.see("end")
+
+    def _sostituisci_riga_progresso(self, msg: str, tag: str):
+        """Usato SOLO dal ramo tag=="progress" di _poll_log: cancella la
+        vecchia riga di progresso "viva" (se presente) e la sostituisce con
+        quella nuova, tenendo traccia della sua posizione per la prossima
+        sostituzione."""
+        if self._progresso_range is not None:
+            self._log.delete(*self._progresso_range)
+        inizio = self._log.index("end-1c")
+        self._log.insert("end", msg + "\n", tag)
+        self._progresso_range = (inizio, self._log.index("end-1c"))
 
     def _poll_log(self):
         try:
@@ -4252,13 +4587,22 @@ class App(_BaseTk):
                         self._btn_stop.configure(state="disabled")
                         self._lbl_stato.config(text="Completato")
                     self._active_op = None
+                    self._ripristina_sospensione()
                     # tre campanelle di sistema distanziate (cross-platform via Tk)
                     for i in range(3):
                         self.after(i * 250, self.bell)
                 elif tag == "progress":
-                    self._log.delete("end-2l", "end-1l")
-                    self._log.insert("end", msg + "\n", tag)
-                    self._log.see("end")
+                    # Se l'utente sta selezionando del testo, congela questa
+                    # riga (si aggiorna di nuovo al prossimo giro senza
+                    # selezione attiva) invece di cancellarla e riscriverla:
+                    # altrimenti, con una riga di progresso al secondo,
+                    # sarebbe impossibile selezionare/copiare qualunque cosa
+                    # durante una conversione in corso.
+                    if not self._log.tag_ranges("sel"):
+                        segui = self._log_in_fondo()
+                        self._sostituisci_riga_progresso(msg, tag)
+                        if segui:
+                            self._log.see("end")
                 else:
                     self._log_write(tag, msg)
         except queue.Empty:

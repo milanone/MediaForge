@@ -58,6 +58,15 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   scaling, encoder args, timestamp handling)
 - `converti_file()` / `worker()` — runs conversion in a background thread, streaming log lines
   back to the UI via a `queue.Queue`
+- `esegui_ffmpeg_con_watchdog()` — runs one ffmpeg attempt and detects a STALL (`time=` in the
+  progress line frozen for 5s — checked every loop iteration, not only when no output arrives at
+  all, since a stalled process can still flood non-progress lines, e.g. repeated `Starting new
+  cluster due to timestamp`) distinctly from a normal error exit; typical cause is a subtitle
+  track with a corrupted timestamp confusing the muxer's interleaving. `converti_file()` reacts to
+  a stall by retrying once without subtitles, then muxes them back in via
+  `build_postmux_sottotitoli_cmd()`/`esegui_postmux_sottotitoli()` (pure stream copy, no
+  re-encoding) — the same "exclude, mux back in afterward" path also exists as the manual
+  `subs=="mux"` option (see `build_ffmpeg_cmd()`, which treats it like `"no"` for the main encode)
 - A "solo audio" (audio-only) mode exists too — `_build_audio_cmd()`, output extension picked
   from `AUDIO_ONLY_EXT` based on the chosen audio codec (`copy` → `.mka`)
 - Stream selection panel, live command preview, single-file metadata/trim panel, real-bitrate
@@ -81,6 +90,17 @@ Chapter list editing, with import/export in OGM chapter format (`formatta_capito
 (`scrivi_ffmetadata_capitoli()`). Two application paths depending on what's available:
 `mkvpropedit` (fast, no remux — `usa_mkvpropedit_per()`) or a full ffmpeg remux fallback
 (`build_capitoli_cmd()`) when it isn't. Driven by `genera_capitoli()`/`capitoli_worker()`.
+
+### Log panel
+
+Shared by all three tabs (`_poll_log()` drains each tab's `queue.Queue`). Progress lines
+(frame/fps/time/speed) overwrite the previous one in place instead of accumulating — tracked via
+`self._progresso_range`, set by `_sostituisci_riga_progresso()` and cleared (without deleting the
+text) by `_dimentica_riga_progresso()` whenever any other line is written, so a progress line that
+gets followed by e.g. a warning becomes permanent history instead of being silently deleted along
+with it. Auto-scroll and the live progress rewrite both pause while the user has an active
+selection or has scrolled away from the bottom (`_log_in_fondo()`), so the log stays selectable/
+copyable (Ctrl+C) during a run instead of being yanked away by the next line.
 
 ## Conventions
 
