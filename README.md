@@ -30,7 +30,8 @@ control the playback side, not a safe default otherwise.
   `Starting new cluster due to timestamp` messages) is detected automatically and retried without
   subtitles, which are then muxed back in afterward with no re-encoding; the same "exclude, mux
   back in afterward" behavior is also available as a manual subtitle option to sidestep the issue
-  proactively instead of waiting for the automatic retry
+  proactively instead of waiting for the automatic retry. Subtitles muxed back in this way honor
+  the same trim as the rest of the file, instead of being pulled in full from the source
 - Available encoders are detected automatically at startup by actually probing ffmpeg on the
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)

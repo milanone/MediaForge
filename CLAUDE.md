@@ -66,7 +66,11 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   a stall by retrying once without subtitles, then muxes them back in via
   `build_postmux_sottotitoli_cmd()`/`esegui_postmux_sottotitoli()` (pure stream copy, no
   re-encoding) — the same "exclude, mux back in afterward" path also exists as the manual
-  `subs=="mux"` option (see `build_ffmpeg_cmd()`, which treats it like `"no"` for the main encode)
+  `subs=="mux"` option (see `build_ffmpeg_cmd()`, which treats it like `"no"` for the main encode).
+  `build_postmux_sottotitoli_cmd()` applies the same `-ss`/`-t` trim as the main encode to the
+  source input it pulls subtitles from — otherwise, with a trim active, they'd come back full
+  length instead of cut to match the video/audio (bug found on a file trimmed to 16 minutes whose
+  postmuxed subtitles still spanned nearly the whole original film)
 - A "solo audio" (audio-only) mode exists too — `_build_audio_cmd()`, output extension picked
   from `AUDIO_ONLY_EXT` based on the chosen audio codec (`copy` → `.mka`)
 - Stream selection panel, live command preview, single-file metadata/trim panel, real-bitrate

@@ -957,12 +957,31 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
     if vf_filters:
         cmd += ["-vf", ",".join(vf_filters)]
 
+    # Un trim (-ss/-t) invalida i tag statistici mkvmerge (STATS_TAGS_MKV)
+    # anche su uno stream lasciato in "copia": ffmpeg ricalcola da solo
+    # "DURATION" in base al contenuto realmente scritto, ma NON tocca
+    # BPS/NUMBER_OF_BYTES/NUMBER_OF_FRAMES, che restano quelli dell'INTERO
+    # file sorgente (verificato: estraendo 4s da un file di 12s con audio in
+    # copia, NUMBER_OF_BYTES/BPS restavano quelli dei 12s originali,
+    # calcolando poi un bitrate dichiarato ~3 volte troppo alto). Vanno
+    # quindi svuotati anche qui, non solo sugli stream ricodificati.
+    trim_attivo = bool(opts.get("ss")) or bool(opts.get("t"))
+
     # --- Video ---
+    # Parti della nota "ENCODING_SETTINGS" (vedi sotto): valorizzata solo se
+    # il video viene RICODIFICATO (altrimenti non c'è nulla da annotare sulla
+    # sua codifica), completata con l'eventuale audio ricodificato più sotto
+    # e scritta in coda, a sezione Audio già decisa.
+    nota_codifica = None
+
     if opts.get("vcodec") == "copy":
         cmd += ["-c:v", "copy"]
         if aspect_flag:
             cmd += ["-aspect", aspect_flag]
         video_is_hevc = video is not None and video.get("codec_name") == "hevc"
+        if video is not None and trim_attivo:
+            for tag in STATS_TAGS_MKV:
+                cmd += ["-metadata:s:v:0", f"{tag}="]
     else:
         cmd += encoder_video_args(opts.get("vcodec", "hevc_qsv"),
                                   opts["quality"], opts["look_ahead"])
@@ -976,6 +995,26 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             # l'unico: più tracce video non sono un caso gestito da questa app).
             for tag in STATS_TAGS_MKV:
                 cmd += ["-metadata:s:v:0", f"{tag}="]
+            # Annota i parametri di codifica usati (encoder/CRF, look-ahead,
+            # e ogni filtro/impostazione applicata rispetto ai default —
+            # risoluzione, aspect ratio, fps, flip, poi l'audio più sotto):
+            # utile per ricordarsi in futuro come è stato prodotto il file
+            # senza doverlo ririlevare da MediaInfo o tenerne nota a parte.
+            nota_codifica = [f"{opts.get('vcodec')} CRF={opts['quality']}"]
+            if opts.get("look_ahead") and opts.get("vcodec") not in (
+                    "libx265", "libsvtav1", "hevc_videotoolbox"):
+                nota_codifica.append("look-ahead")
+            if opts.get("limite_res"):
+                nota_codifica.append(f"max {opts['limite_res']}p")
+            ar_mode = opts.get("ar_mode", "nessuna")
+            if ar_mode != "nessuna":
+                nota_codifica.append(f"{ar_mode} {opts.get('ar_ratio', '')}".strip())
+            if opts.get("limit_fps") and opts.get("fps_value", 0) > 0:
+                nota_codifica.append(f"fps={opts['fps_value']}")
+            if opts.get("hflip"):
+                nota_codifica.append("hflip")
+            if opts.get("vflip"):
+                nota_codifica.append("vflip")
 
     if video_is_hevc and opts.get("output_ext") == "mp4":
         # ffmpeg marca l'HEVC in MP4 come "hev1" di default: QuickTime/iOS/macOS
@@ -984,8 +1023,18 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         cmd += ["-tag:v", "hvc1"]
 
     # --- Audio ---
+    if opts.get("stream_map"):
+        n_audio = sum(1 for i in opts["stream_map"]
+                      if i < len(streams) and streams[i].get("codec_type") == "audio")
+    else:
+        n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
+
     if opts["audio"] == "copy":
         cmd += ["-c:a", "copy"]
+        if trim_attivo:
+            for i in range(n_audio):
+                for tag in STATS_TAGS_MKV:
+                    cmd += [f"-metadata:s:a:{i}", f"{tag}="]
     else:
         if opts["audio"] == "aac":
             cmd += ["-c:a", "aac", "-b:a", "128k"]
@@ -997,14 +1046,15 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         # mkvmerge (STATS_TAGS_MKV) ereditati dal sorgente su ogni stream
         # audio effettivamente ricodificato (non più validi col nuovo
         # bitrate fisso scelto).
-        if opts.get("stream_map"):
-            n_audio = sum(1 for i in opts["stream_map"]
-                          if i < len(streams) and streams[i].get("codec_type") == "audio")
-        else:
-            n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
         for i in range(n_audio):
             for tag in STATS_TAGS_MKV:
                 cmd += [f"-metadata:s:a:{i}", f"{tag}="]
+        if nota_codifica is not None:
+            bitrate_audio = {"aac": "128k", "ac3": "384k", "mp3": "128k"}.get(opts["audio"], "")
+            nota_codifica.append(f"audio {opts['audio']} {bitrate_audio}".strip())
+
+    if nota_codifica is not None:
+        cmd += ["-metadata:s:v:0", f"ENCODING_SETTINGS={', '.join(nota_codifica)}"]
 
     # --- Sottotitoli ---
     subs = opts.get("subs", "copy")
@@ -1060,7 +1110,12 @@ def build_postmux_sottotitoli_cmd(encoded_path: Path, src: Path, src_data: dict,
     passaggio di codifica vero e proprio, più lento e più esposto a stalli su
     timestamp corrotti, e aggiungerli qui con un remux separato — più veloce
     e più semplice perché non deve interlacciare anche video/audio da
-    ricodificare."""
+    ricodificare.
+    Applica lo stesso -ss/-t della codifica principale (opts) anche qui, sul
+    sorgente da cui vengono presi i sottotitoli: altrimenti, con un trim
+    attivo, arriverebbero integrali (l'intero file) invece che tagliati
+    quanto video/audio — bug osservato: un file accorciato a 16 minuti aveva
+    i sottotitoli lunghi quasi quanto l'intero film."""
     streams = src_data.get("streams", [])
     if opts.get("stream_map"):
         sub_idx = [i for i in opts["stream_map"]
@@ -1068,8 +1123,13 @@ def build_postmux_sottotitoli_cmd(encoded_path: Path, src: Path, src_data: dict,
     else:
         sub_idx = [i for i, s in enumerate(streams) if s.get("codec_type") == "subtitle"]
 
-    cmd = ["ffmpeg", "-y", "-i", str(encoded_path), "-i", str(src),
-           "-map", "0", "-map_metadata", "0"]
+    cmd = ["ffmpeg", "-y", "-i", str(encoded_path)]
+    if opts.get("ss"):
+        cmd += ["-ss", opts["ss"]]
+    cmd += ["-i", str(src)]
+    if opts.get("t"):
+        cmd += ["-t", opts["t"]]
+    cmd += ["-map", "0", "-map_metadata", "0"]
     for i in sub_idx:
         cmd += ["-map", f"1:{i}"]
     cmd += ["-c", "copy"]
