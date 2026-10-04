@@ -1,0 +1,2 @@
+# optional: drag-and-drop of files (the program also works without it)
+tkinterdnd2

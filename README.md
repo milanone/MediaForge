@@ -64,3 +64,7 @@ pythonw MediaForge.pyw
 
 - `MediaForge.pyw` — main application (a single `App` class), three tabs (Encode / Mux /
   Chapters) sharing one log panel
+
+## License
+
+[MIT](LICENSE)
