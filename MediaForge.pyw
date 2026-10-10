@@ -697,11 +697,14 @@ def _build_audio_cmd(src: Path, dst: Path, opts: dict, streams: list) -> list:
     return cmd
 
 
-def costruisci_filtri_video(opts: dict, video: dict, warnings: list = None) -> list:
+def costruisci_filtri_video(opts: dict, video: dict, warnings: list = None,
+                             scala_gpu: bool = False) -> list:
     """Costruisce la lista di filtri -vf (scala/aspect ratio/fps/flip) dalle
     opzioni di conversione. Condivisa tra build_ffmpeg_cmd e l'anteprima
     frame (estrai_frame_anteprima), così quel che si vede in anteprima
-    coincide sempre con l'output reale della conversione."""
+    coincide sempre con l'output reale della conversione.
+    scala_gpu=True emette il ridimensionamento al limite di risoluzione come
+    scale_qsv (frame già su GPU, vedi build_ffmpeg_cmd) invece di scale."""
     vf_filters = []
     # iw_eff/ih_eff seguono le dimensioni "effettive" via via che i filtri
     # precedenti (qui, lo scaling) le modificano: servono più sotto per
@@ -714,16 +717,21 @@ def costruisci_filtri_video(opts: dict, video: dict, warnings: list = None) -> l
         ih_eff = int(video.get("height", 0)) or None
     if video and limite and iw_eff and ih_eff:
         portrait = ih_eff > iw_eff
+        # scale_qsv (scala_gpu) non accetta il "-2" di scale (solo -1, che
+        # non garantisce un numero pari): le dimensioni vanno quindi
+        # calcolate qui, arrotondate al pari come farebbe "-2".
         if portrait and iw_eff > limite:
             # Portrait: 1080p = larghezza 1080 (es. 2160x3840 → 1080x1920)
-            vf_filters.append(f"scale={limite}:-2")
             ih_eff = 2 * round(ih_eff * limite / iw_eff / 2)
             iw_eff = limite
+            vf_filters.append(f"scale_qsv=w={iw_eff}:h={ih_eff}" if scala_gpu
+                              else f"scale={limite}:-2")
         elif not portrait and ih_eff > limite:
             # Landscape: 1080p = altezza 1080 (es. 3840x2160 → 1920x1080)
-            vf_filters.append(f"scale=-2:{limite}")
             iw_eff = 2 * round(iw_eff * limite / ih_eff / 2)
             ih_eff = limite
+            vf_filters.append(f"scale_qsv=w={iw_eff}:h={ih_eff}" if scala_gpu
+                              else f"scale=-2:{limite}")
 
     # --- Aspect ratio ---
     ar_mode = opts.get("ar_mode", "nessuna")
@@ -897,7 +905,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         return _build_audio_cmd(src, dst, opts, streams)
     video    = next((s for s in streams if s.get("codec_type") == "video"), None)
 
-    vf_filters = costruisci_filtri_video(opts, video, warnings)
+    usa_gpu = hwaccel_decode and usa_hwaccel_decode(opts.get("vcodec"))
+    vf_filters = costruisci_filtri_video(opts, video, warnings, scala_gpu=usa_gpu)
 
     # "Solo correggi DAR" + "Copia stream" (nessuna ricodifica): il filtro
     # setdar richiede comunque una pipeline di decodifica/codifica, quindi è
@@ -917,16 +926,17 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         vf_filters = rimanenti
 
     cmd = ["ffmpeg", "-y"]
-    if hwaccel_decode and usa_hwaccel_decode(opts.get("vcodec")):
-        # hwaccel_output_format forza i frame decodificati in memoria di
-        # sistema (non surface GPU "zero-copy"): così i filtri software già
-        # esistenti (crop/pad/scale/setdar/hflip/ecc., vedi vf_filters sopra)
-        # continuano a funzionare invariati, e l'encoder qsv in uscita accetta
-        # comunque questi frame (li ricarica lui stesso sulla GPU). nv12 per
-        # sorgenti 8 bit, p010le per 10 bit/HDR (vedi hwaccel_output_format()):
-        # forzare nv12 su una sorgente 10 bit troncherebbe la profondità colore.
-        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format",
-                hwaccel_output_format(video)]
+    if usa_gpu:
+        # I frame restano su GPU (superfici d3d11) dalla decodifica
+        # all'encoder: hwmap li passa a QSV senza copie in memoria di sistema
+        # e il ridimensionamento al limite di risoluzione avviene lì
+        # (scale_qsv, vedi costruisci_filtri_video). Gli altri filtri (crop/
+        # pad/setdar/fps/flip) sono software: i frame vengono scaricati solo
+        # se servono (hwdownload, nv12 per sorgenti 8 bit / p010le per 10 bit/
+        # HDR, vedi hwaccel_output_format()) e l'encoder qsv li ricarica da
+        # solo. Verificato su Intel Iris Xe: 4K HDR10 10 bit → 1080p, metadati
+        # HDR (mastering display/content light level) conservati.
+        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
     if opts.get("ss"):
         cmd += ["-ss", opts["ss"]]
     cmd += ["-i", str(src)]
@@ -954,7 +964,14 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
 
     cmd += ["-map_metadata", "0"]
 
-    if vf_filters:
+    if usa_gpu:
+        catena = ["hwmap=derive_device=qsv", "format=qsv"]
+        if vf_filters and vf_filters[0].startswith("scale_qsv="):
+            catena.append(vf_filters.pop(0))
+        if vf_filters:
+            catena += ["hwdownload", f"format={hwaccel_output_format(video)}"] + vf_filters
+        cmd += ["-vf", ",".join(catena)]
+    elif vf_filters:
         cmd += ["-vf", ",".join(vf_filters)]
 
     # Un trim (-ss/-t) invalida i tag statistici mkvmerge (STATS_TAGS_MKV)

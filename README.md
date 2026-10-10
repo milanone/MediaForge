@@ -35,9 +35,11 @@ control the playback side, not a safe default otherwise.
 - Available encoders are detected automatically at startup by actually probing ffmpeg on the
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)
-- On Windows with a QSV encoder, input decoding uses hardware acceleration (`d3d11va`), picking
-  the matching 8-bit/10-bit pixel format from the source so HDR/10-bit files keep their color
-  depth instead of being silently truncated
+- On Windows with a QSV encoder, decoding and the resolution-cap scaling both run on the GPU
+  (`d3d11va` decode, frames kept on the GPU through `scale_qsv` to the encoder), with HDR/10-bit
+  files keeping their color depth and HDR metadata; other filters (crop/pad/fps/flip) are
+  software and only then pull the frames back to system memory. If hardware decoding fails on a
+  specific file, the app retries it automatically with software decoding
 - Log panel text is selectable and copyable (mouse or Ctrl+C/Ctrl+A) while staying read-only
 - Exact real video bitrate (from packet sizes, not an estimate) and two maintenance tools: fix
   the HEVC tag some players need for HEVC-in-MP4, and fix a stale/wrong bitrate tag

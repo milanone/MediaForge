@@ -55,7 +55,12 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   (`packet=size`), not an estimate from container-level bitrate minus audio (that approach was
   tried first and found unreliable, especially on `.mkv` files with no declared audio bitrate)
 - `build_ffmpeg_cmd()` — assembles the full encode command from `opts` (stream selection, trim,
-  scaling, encoder args, timestamp handling)
+  scaling, encoder args, timestamp handling). With `usa_hwaccel_decode()` (Windows + QSV encoder)
+  frames stay on the GPU: `-hwaccel d3d11va -hwaccel_output_format d3d11`, then `hwmap=derive_device=qsv,
+  format=qsv` and the resolution cap as `scale_qsv=w=W:h=H` (`costruisci_filtri_video(scala_gpu=True)`;
+  scale_qsv doesn't accept `-2`, so even sizes are computed in Python). Any other filter is software
+  and goes after `hwdownload,format=nv12|p010le`. `converti_file()` retries without hwaccel
+  (plain software chain) if the GPU path fails on a file
 - `converti_file()` / `worker()` — runs conversion in a background thread, streaming log lines
   back to the UI via a `queue.Queue`
 - `esegui_ffmpeg_con_watchdog()` — runs one ffmpeg attempt and detects a STALL (`time=` in the
