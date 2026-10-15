@@ -220,6 +220,32 @@ def rileva_pixel_non_quadrati(video: dict) -> str:
             "veloce ma è solo un'etichetta: alcuni player la ignorano.")
 
 
+QSV_ENCODERS = ("hevc_qsv", "av1_qsv")
+# (lato lungo in px, CRF): 480p, 720p, 1080p, 4K; fuori dagli estremi il valore
+# resta fisso, in mezzo si interpola in scala logaritmica del lato.
+QSV_CRF_POINTS = ((854, 16), (1280, 18), (1920, 20), (3840, 22))
+QSV_CRF_DEFAULT = 20
+# Preset QSV: i livelli reali sono 3 (misurato su N150 con hevc_qsv: da fast a
+# slow il file e' identico, faster=veryfast, slower=veryslow).
+QSV_PRESETS = (
+    ("veryfast", "Fast (~-25% time, file ~+10%, same quality)"),
+    ("medium",   "Normal (default)"),
+    ("veryslow", "Slow (~+45% time, file ~-5%, same quality)"),
+)
+
+
+def _interpola_log(x, points) -> float:
+    """Interpolazione lineare in log(x) tra punti (x, y) crescenti, costante
+    fuori dagli estremi."""
+    if x <= points[0][0]:
+        return points[0][1]
+    if x >= points[-1][0]:
+        return points[-1][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * math.log(x / x0) / math.log(x1 / x0)
+
+
 def crf_suggerito(width, height, encoder=None) -> int:
     """CRF di default in base alla risoluzione (scala 1=max qualità … 51=min,
     vedi encoder_video_args): più pixel ha il fotogramma, meglio "nascondono"
@@ -245,8 +271,17 @@ def crf_suggerito(width, height, encoder=None) -> int:
     esterne, che anzi riportano una penalità minima per hevc_qsv su
     hardware Intel recente: tolto in attesa di dati più affidabili."""
     lato_lungo = max(int(width or 0), int(height or 0))
-    base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     famiglia = VIDEO_ENCODERS.get(encoder, (None, None))[1]
+    if encoder in QSV_ENCODERS:
+        # QSV: punti di riferimento da misure VMAF su 8 film 4K con hevc_qsv
+        # (look-ahead), portati dalla versione web; la curva "logaritmica
+        # +3 per raddoppio" qui sotto comprimeva troppo (28 a 4K). Misurato
+        # solo su hevc_qsv: av1_qsv usa la stessa curva con il +1 AV1.
+        base = QSV_CRF_DEFAULT if lato_lungo <= 0 else _interpola_log(lato_lungo, QSV_CRF_POINTS)
+        if famiglia == "av1":
+            base += 1
+        return max(1, min(51, round(base)))
+    base = 25.0 if lato_lungo <= 0 else 25 + 3 * math.log2(lato_lungo / 1920)
     if famiglia == "av1":
         base += 1
     return max(1, min(51, round(base)))
