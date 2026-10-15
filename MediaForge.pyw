@@ -547,11 +547,14 @@ def dimensioni_target_pari(iw: float, ih: float, rapporto: float, modo: str, sar
     return w_grezza, h_grezza, arrotonda(w_grezza), arrotonda(h_grezza)
 
 
-def encoder_video_args(encoder: str, quality, look_ahead: bool) -> list:
+def encoder_video_args(encoder: str, quality, look_ahead: bool, preset: str = None) -> list:
     """Argomenti ffmpeg specifici per l'encoder scelto (qualità 1=max … 51=min)."""
     q = str(quality)
     if encoder == "hevc_qsv":
         args = ["-c:v", "hevc_qsv", "-global_quality", q]
+        # Solo hevc_qsv: i 3 livelli QSV_PRESETS sono misurati su di lui.
+        if preset in dict(QSV_PRESETS):
+            args += ["-preset", preset]
         if look_ahead:
             args += ["-look_ahead", "1"]
     elif encoder == "hevc_amf":
@@ -1054,7 +1057,7 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
                 cmd += ["-metadata:s:v:0", f"{tag}="]
     else:
         cmd += encoder_video_args(opts.get("vcodec", "hevc_qsv"),
-                                  opts["quality"], opts["look_ahead"])
+                                  opts["quality"], opts["look_ahead"], opts.get("preset"))
         _, famiglia = VIDEO_ENCODERS.get(opts.get("vcodec"), (None, "hevc"))
         video_is_hevc = famiglia == "hevc"
         if video is not None:
@@ -1074,6 +1077,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             if opts.get("look_ahead") and opts.get("vcodec") not in (
                     "libx265", "libsvtav1", "hevc_videotoolbox"):
                 nota_codifica.append("look-ahead")
+            if opts.get("vcodec") == "hevc_qsv" and opts.get("preset") in ("veryfast", "veryslow"):
+                nota_codifica.append(f"preset={opts['preset']}")
             if opts.get("limite_res"):
                 nota_codifica.append(f"max {opts['limite_res']}p")
             ar_mode = opts.get("ar_mode", "nessuna")
@@ -2614,6 +2619,15 @@ class App(_BaseTk):
         self._var_lookahead = tk.BooleanVar(value=True)
         self._chk_lookahead = ttk.Checkbutton(r2, text="Look-ahead", variable=self._var_lookahead)
         self._chk_lookahead.pack(side="left")
+        ttk.Label(r2, text="Preset:").pack(side="left", padx=(20,4))
+        self._var_preset = tk.StringVar(value=QSV_PRESETS[1][1])
+        self._combo_preset = ttk.Combobox(r2, textvariable=self._var_preset, width=44,
+                                          state="readonly",
+                                          values=[lbl for _v, lbl in QSV_PRESETS])
+        self._combo_preset.pack(side="left")
+        Tooltip(self._combo_preset, "Intel QSV (HEVC) has only 3 real speed levels "
+                "(measured: ffmpeg's fast/medium/slow give the same file).\nEnabled only for hevc_qsv.")
+        self._combo_preset.bind("<<ComboboxSelected>>", lambda _e: self._aggiorna_anteprima())
         self._var_limit_fps = tk.BooleanVar(value=False)
         ttk.Checkbutton(r2, text="Limita FPS a", variable=self._var_limit_fps,
                         command=self._toggle_fps).pack(side="left", padx=(20,4))
@@ -3096,6 +3110,7 @@ class App(_BaseTk):
             "vcodec":     self._vcodec_id(),
             "quality":    self._var_quality.get(),
             "look_ahead": self._var_lookahead.get(),
+            "preset":     self._preset_id(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
             "audio":      self._var_audio.get(),
@@ -3574,6 +3589,11 @@ class App(_BaseTk):
         self._var_vcodec.set(default_lbl)
         self._toggle_vcodec()
 
+    def _preset_id(self) -> str:
+        """Preset QSV scelto ('veryfast'/'medium'/'veryslow'); usato solo da hevc_qsv."""
+        label = self._var_preset.get()
+        return next((v for v, lbl in QSV_PRESETS if lbl == label), "medium")
+
     def _toggle_vcodec(self):
         encode = self._vcodec_id() != "copy"
         state  = "normal" if encode else "disabled"
@@ -3582,6 +3602,8 @@ class App(_BaseTk):
         la_state = ("normal" if encode and self._vcodec_id()
                     not in ("libx265", "libsvtav1", "hevc_videotoolbox") else "disabled")
         self._chk_lookahead.configure(state=la_state)
+        self._combo_preset.configure(
+            state="readonly" if self._vcodec_id() == "hevc_qsv" else "disabled")
         # Cambiare encoder (es. HEVC → AV1) ricalcola il CRF proposto con lo
         # scarto giusto per la nuova famiglia (vedi crf_suggerito), ma solo
         # se non è già stato modificato a mano.
@@ -3939,6 +3961,7 @@ class App(_BaseTk):
             "vcodec":     self._vcodec_id(),
             "quality":    self._var_quality.get(),
             "look_ahead": self._var_lookahead.get(),
+            "preset":     self._preset_id(),
             "hflip":      self._var_hflip.get(),
             "vflip":      self._var_vflip.get(),
             "ar_mode":    self._var_ar_mode.get(),

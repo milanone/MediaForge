@@ -35,6 +35,8 @@ control the playback side, not a safe default otherwise.
 - Available encoders are detected automatically at startup by actually probing ffmpeg on the
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)
+- QSV (HEVC) offers 3 real preset levels (fast / normal / slow), and its default CRF follows
+  measured values per resolution (480p=16, 720p=18, 1080p=20, 4K=22)
 - On Windows with a QSV encoder, decoding and the resolution-cap scaling both run on the GPU
   (`d3d11va` decode, frames kept on the GPU through `scale_qsv` to the encoder), with HDR/10-bit
   files keeping their color depth and HDR metadata; other filters (crop/pad/fps/flip) are

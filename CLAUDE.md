@@ -44,10 +44,14 @@ subclass when `tkinterdnd2` is available). Three tabs (`ttk.Notebook`) sharing o
 
 Batch-converts a folder of video files to HEVC/AV1. Key pieces:
 - `encoder_video_args()` — per-encoder ffmpeg args (QSV/AMF/NVENC each need different rate-control
-  flags; VideoToolbox uses an inverted 1-100 quality scale vs. the GUI's CRF-style 1-51)
+  flags; VideoToolbox uses an inverted 1-100 quality scale vs. the GUI's CRF-style 1-51; `hevc_qsv`
+  also gets `-preset` from the 3 real QSV levels veryfast/medium/veryslow, `QSV_PRESETS`)
 - `crf_suggerito()` — default CRF from the selected file's resolution (higher resolution → higher
   CRF, same perceived quality) and a -4 offset for the AV1 family (more efficient than HEVC/H.264
-  at the same CRF number); applied on file selection and on encoder change via
+  at the same CRF number). QSV encoders (`QSV_ENCODERS`) use a separate measured curve instead:
+  `QSV_CRF_POINTS` (480p=16, 720p=18, 1080p=20, 4K=22, log-interpolated; from VMAF runs on 4K
+  films with `hevc_qsv`, ported from MediaForge web; `av1_qsv` reuses it with +1, unmeasured).
+  Applied on file selection and on encoder change via
   `_aggiorna_quality_da_risoluzione()`, until the user edits the value by hand
   (`_quality_manuale`) — the "↺ Auto" button re-enables it
 - `costruisci_filtri_video()` — builds the ffmpeg filter chain (scale/aspect-ratio/FPS/flip)
@@ -59,7 +63,11 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   frames stay on the GPU: `-hwaccel d3d11va -hwaccel_output_format d3d11`, then `hwmap=derive_device=qsv,
   format=qsv` and the resolution cap as `scale_qsv=w=W:h=H` (`costruisci_filtri_video(scala_gpu=True)`;
   scale_qsv doesn't accept `-2`, so even sizes are computed in Python). Any other filter is software
-  and goes after `hwdownload,format=nv12|p010le`. `converti_file()` retries without hwaccel
+  and goes after `hwdownload,format=nv12|p010le`. GPU decoding is gated on the source
+  (`sorgente_decodificabile_hw()`: h264/hevc/av1/vp9/mpeg2/vc1, 4:2:0 8/10 bit); anything else (4:2:2,
+  4:4:4, 12 bit, ProRes…) goes straight to software decoding instead of failing first. List measured
+  on an N150 in the web version; mjpeg dropped from it (d3d11va has no MJPEG decoder, not tested here).
+  `converti_file()` retries without hwaccel
   (plain software chain) if the GPU path fails on a file
 - `converti_file()` / `worker()` — runs conversion in a background thread, streaming log lines
   back to the UI via a `queue.Queue`
