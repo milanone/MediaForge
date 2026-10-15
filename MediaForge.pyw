@@ -904,7 +904,24 @@ def estrai_frame_anteprima(src: Path, ss: str, opts: dict, video: dict, dst_png:
         return False, str(e)
 
 
-def usa_hwaccel_decode(vcodec: str) -> bool:
+# Sorgenti che la iGPU Intel decodifica in hardware (lista misurata sulla
+# versione web con N150, tolto mjpeg: d3d11va non lo supporta): 4:2:0 a 8/10
+# bit. Altro (es. 4:2:2, 4:4:4, 12 bit) va subito in software invece di
+# fallire e perdere i secondi del watchdog prima del ripiego.
+HW_DECODE_CODECS = {"h264", "hevc", "av1", "vp9", "mpeg2video", "vc1"}
+HW_DECODE_PIXFMTS = {"yuv420p", "yuvj420p", "yuv420p10le", "nv12", "p010le"}
+
+
+def sorgente_decodificabile_hw(video) -> bool:
+    """True se codec e pixel format dello stream video sono decodificabili
+    dalla GPU (vedi HW_DECODE_CODECS); senza info sulla sorgente, True."""
+    if not video:
+        return True
+    return (video.get("codec_name") in HW_DECODE_CODECS
+            and video.get("pix_fmt") in HW_DECODE_PIXFMTS)
+
+
+def usa_hwaccel_decode(vcodec: str, video: dict = None) -> bool:
     """True se per questo encoder ha senso provare la decodifica hardware
     dell'input (vedi build_ffmpeg_cmd/hwaccel_decode): solo con un encoder
     Intel QSV su Windows. Con un encoder hardware si è visto che ffmpeg
@@ -915,7 +932,8 @@ def usa_hwaccel_decode(vcodec: str) -> bool:
     funziona ed è comunque compatibile in uscita con l'encoder qsv. Non
     verificato su AMD/NVENC/macOS/Linux: lì l'encoder resta software-decode
     come prima, nessun cambiamento."""
-    return sys.platform == "win32" and vcodec in ("hevc_qsv", "av1_qsv")
+    return (sys.platform == "win32" and vcodec in ("hevc_qsv", "av1_qsv")
+            and sorgente_decodificabile_hw(video))
 
 
 def hwaccel_output_format(video: dict) -> str:
@@ -940,7 +958,7 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         return _build_audio_cmd(src, dst, opts, streams)
     video    = next((s for s in streams if s.get("codec_type") == "video"), None)
 
-    usa_gpu = hwaccel_decode and usa_hwaccel_decode(opts.get("vcodec"))
+    usa_gpu = hwaccel_decode and usa_hwaccel_decode(opts.get("vcodec"), video)
     vf_filters = costruisci_filtri_video(opts, video, warnings, scala_gpu=usa_gpu)
 
     # "Solo correggi DAR" + "Copia stream" (nessuna ricodifica): il filtro
@@ -1541,7 +1559,14 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
     # tutti i codec/sorgenti sono decodificabili in hardware (verificato che
     # perfino "-hwaccel qsv" fallisce in decodifica su alcuni file/driver, pur
     # con l'encoder qsv scelto perfettamente funzionante).
-    hwaccel = usa_hwaccel_decode(opts.get("vcodec"))
+    video_src = next((s for s in data.get("streams", [])
+                      if s.get("codec_type") == "video"), None)
+    hwaccel = usa_hwaccel_decode(opts.get("vcodec"), video_src)
+    if (not hwaccel and usa_hwaccel_decode(opts.get("vcodec"))
+            and video_src is not None):
+        log_q.put(("detail", f"  Decodifica GPU saltata: sorgente non supportata "
+                   f"({video_src.get('codec_name')}, {video_src.get('pix_fmt')}), "
+                   "decodifica software."))
 
     while True:
         # dst_encode è il bersaglio REALE di questo tentativo di codifica:
