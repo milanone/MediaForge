@@ -1910,7 +1910,7 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
             except Exception:
                 pass
             br_txt = f"  {out_br // 1000} kbps" if out_br else ""
-            log_q.put(("ok", f"  ✓ {dst.name}  [{size_src:.1f} MB → {size_dst:.1f} MB  {risparmio:+.0f}%{br_txt}]"))
+            log_q.put(("ok", f"  ✓ {dst.name}  [{size_src:.1f} MB → {size_dst:.1f} MB  {-risparmio:+.0f}%{br_txt}]"))
             return True
 
         except Exception as e:
