@@ -108,15 +108,39 @@ class FpsRules(unittest.TestCase):
 class GpuDecodeSafety(unittest.TestCase):
     """The GPU path dropped 31% of the frames of a 1080p AV1 film while ffmpeg exited with success."""
 
-    @unittest.skipUnless(sys.platform == "win32", "the d3d11va path is Windows only")
-    def test_gpu_command_enlarges_the_surface_pool(self):
+    def _cmd(self, mode, **extra):
         data = {"streams": [video("av1", "yuv420p", 1920, 1080)]}
-        opts = {"mode": "video", "output_ext": "mp4", "vcodec": "hevc_qsv", "quality": 22, "look_ahead": True,
-                "audio": "copy", "subs": "copy", "timestamp": "", "limite_res": None}
-        cmd = mf.build_ffmpeg_cmd(Path("in.mp4"), Path("out.mp4"), opts, data)
-        self.assertIn("-hwaccel", cmd)
+        opts = dict({"mode": "video", "output_ext": "mp4", "vcodec": "hevc_qsv", "quality": 22, "look_ahead": True,
+                     "audio": "copy", "subs": "copy", "timestamp": "", "limite_res": None}, **extra)
+        return mf.build_ffmpeg_cmd(Path("in.mp4"), Path("out.mp4"), opts, data, hwaccel_decode=mode)
+
+    @unittest.skipUnless(sys.platform == "win32", "the GPU paths are Windows only")
+    def test_default_gpu_path_is_direct_qsv(self):
+        cmd = self._cmd(True)
+        self.assertEqual(cmd[cmd.index("-hwaccel") + 1], "qsv")
+        self.assertNotIn("hwmap=derive_device=qsv", " ".join(cmd))   # frames are already QSV surfaces
+        self.assertNotIn("-vf", cmd)                                  # nothing to filter: no filter chain at all
+
+    @unittest.skipUnless(sys.platform == "win32", "the GPU paths are Windows only")
+    def test_direct_qsv_scales_on_the_gpu_and_downloads_only_for_other_filters(self):
+        self.assertEqual(self._cmd("qsv", limite_res=720)[self._cmd("qsv", limite_res=720).index("-vf") + 1],
+                         "scale_qsv=w=1280:h=720")
+        vf = self._cmd("qsv", limite_res=720, hflip=True)
+        self.assertEqual(vf[vf.index("-vf") + 1], "scale_qsv=w=1280:h=720,hwdownload,format=nv12,hflip")
+
+    @unittest.skipUnless(sys.platform == "win32", "the GPU paths are Windows only")
+    def test_d3d11va_path_enlarges_the_surface_pool(self):
+        cmd = self._cmd("d3d11va")
+        self.assertEqual(cmd[cmd.index("-hwaccel") + 1], "d3d11va")
         self.assertEqual(cmd[cmd.index("-extra_hw_frames") + 1], "24")
         self.assertLess(cmd.index("-extra_hw_frames"), cmd.index("-i"))  # an input option
+        self.assertIn("hwmap=derive_device=qsv,format=qsv", cmd[cmd.index("-vf") + 1])
+
+    def test_software_decoding_has_no_hwaccel(self):
+        self.assertNotIn("-hwaccel", self._cmd(False))
+
+    def test_fallback_order(self):
+        self.assertEqual(mf.HW_DECODE_MODES, ("qsv", "d3d11va"))
 
     def test_watchdog_stops_on_a_decoder_error_line(self):
         import queue, threading, time

@@ -1108,6 +1108,15 @@ def usa_hwaccel_decode(vcodec: str, video: dict = None) -> bool:
             and sorgente_decodificabile_hw(video))
 
 
+# GPU decoding methods, in the order they are tried; a failure steps down to the next one and finally to
+# software (see converti_file). "qsv" = ffmpeg's own QSV decoder, frames stay in QSV surfaces all the way to the
+# encoder (no hwmap, no d3d11 pool); "d3d11va" = the Windows native decoder + hwmap to QSV. Added 2026-10-18: the
+# d3d11 path dropped frames with a 1080p AV1 film (see extra_hw_frames below), while direct QSV decoding gave all the
+# frames on AV1 1080p and HEVC 4K 10 bit with the current ffmpeg/driver, at the same speed. The note in
+# usa_hwaccel_decode about "-hwaccel qsv" failing dates from an older ffmpeg/driver: hence the fallback chain.
+HW_DECODE_MODES = ("qsv", "d3d11va")
+
+
 def hwaccel_output_format(video: dict) -> str:
     """nv12 (8 bit) o p010le (10 bit) in base al pix_fmt della sorgente:
     forzare nv12 su una sorgente a 10 bit (es. HDR10) tronca la profondità
@@ -1124,13 +1133,16 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
     hwaccel_decode=False forza la decodifica software anche quando
     usa_hwaccel_decode() sarebbe True: usato da converti_file per riprovare
     senza hwaccel se la decodifica hardware fallisce su un file specifico
-    (non tutti i codec/sorgenti sono decodificabili in hardware)."""
+    (non tutti i codec/sorgenti sono decodificabili in hardware).
+    hwaccel_decode può anche essere un nome di HW_DECODE_MODES ("qsv" o
+    "d3d11va"); True = il primo (qsv)."""
     streams  = data.get("streams", [])
     if opts.get("mode") == "audio":
         return _build_audio_cmd(src, dst, opts, streams)
     video    = next((s for s in streams if s.get("codec_type") == "video"), None)
 
-    usa_gpu = (hwaccel_decode and opts.get("gpu_decode", True)
+    hw_mode = hwaccel_decode if isinstance(hwaccel_decode, str) else (HW_DECODE_MODES[0] if hwaccel_decode else None)
+    usa_gpu = (bool(hw_mode) and opts.get("gpu_decode", True)
                and usa_hwaccel_decode(opts.get("vcodec"), video))
     vf_filters = costruisci_filtri_video(opts, video, warnings, scala_gpu=usa_gpu)
 
@@ -1166,7 +1178,11 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         # QSV encoder (look-ahead, hwmap) exhaust it and the decoder DROPS frames ("Static surface pool
         # size exceeded", "Error submitting packet to decoder") while ffmpeg still exits with success:
         # on a 1080p AV1 film only 1841 of 2700 frames reached the output, A/V sync was lost.
-        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11", "-extra_hw_frames", "24"]
+        if hw_mode == "qsv":
+            # direct QSV decoding: frames are already QSV surfaces, the encoder takes them as they are
+            cmd += ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"]
+        else:
+            cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11", "-extra_hw_frames", "24"]
     if opts.get("ss"):
         cmd += ["-ss", opts["ss"]]
     cmd += ["-i", str(src)]
@@ -1195,12 +1211,14 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
     cmd += ["-map_metadata", "0"]
 
     if usa_gpu:
-        catena = ["hwmap=derive_device=qsv", "format=qsv"]
+        # d3d11 frames must be mapped to QSV first; direct QSV frames already are
+        catena = ["hwmap=derive_device=qsv", "format=qsv"] if hw_mode == "d3d11va" else []
         if vf_filters and vf_filters[0].startswith("scale_qsv="):
             catena.append(vf_filters.pop(0))
         if vf_filters:
             catena += ["hwdownload", f"format={hwaccel_output_format(video)}"] + vf_filters
-        cmd += ["-vf", ",".join(catena)]
+        if catena:
+            cmd += ["-vf", ",".join(catena)]
     elif vf_filters:
         cmd += ["-vf", ",".join(vf_filters)]
 
@@ -1834,7 +1852,9 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
     # con l'encoder qsv scelto perfettamente funzionante).
     video_src = next((s for s in data.get("streams", [])
                       if s.get("codec_type") == "video"), None)
-    hwaccel = usa_hwaccel_decode(opts.get("vcodec"), video_src) and opts.get("gpu_decode", True)
+    hw_chain = (list(HW_DECODE_MODES)
+                if usa_hwaccel_decode(opts.get("vcodec"), video_src) and opts.get("gpu_decode", True) else [])
+    hwaccel = hw_chain.pop(0) if hw_chain else None  # current GPU decoding method, None = software
     if (not hwaccel and usa_hwaccel_decode(opts.get("vcodec"))
             and video_src is not None and opts.get("gpu_decode", True)):
         log_q.put(("detail", f"  Decodifica GPU saltata: sorgente non supportata "
@@ -1852,7 +1872,9 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
         try:
             warnings = []
             cmd = build_ffmpeg_cmd(src, dst_encode, opts_encode, data, warnings,
-                                    hwaccel_decode=hwaccel)
+                                    hwaccel_decode=hwaccel or False)
+            if hwaccel:
+                log_q.put(("detail", f"  GPU decoding: {hwaccel}"))
             for w in warnings:
                 log_q.put(("warning", f"  ⚠ {w}"))
             log_q.put(("cmd", "  $ " + " ".join(cmd)))
@@ -1897,11 +1919,12 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
 
             if esito == "errore":
                 if hwaccel:
+                    prossimo = hw_chain.pop(0) if hw_chain else None
                     log_q.put(("warning",
-                        "  ⚠ Decodifica hardware non riuscita per questo file: ripiego "
-                        "su decodifica software e riprovo."))
+                        f"  ⚠ Decodifica hardware ({hwaccel}) non riuscita per questo file: ripiego "
+                        f"su {prossimo or 'decodifica software'} e riprovo."))
                     dst_encode.unlink(missing_ok=True)
-                    hwaccel = False
+                    hwaccel = prossimo
                     continue
                 log_q.put(("error", f"  ✗ Errore ffmpeg (codice {returncode})"))
                 # Rimuove l'eventuale file di destinazione (parziale, o un
