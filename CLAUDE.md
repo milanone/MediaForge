@@ -85,6 +85,11 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   subtitles are not added to a partial file; stopping during 2-pass pass 1 keeps nothing; if ffmpeg
   doesn't close within 30 s it is terminated and the file discarded. Tested on mkv/mp4 with
   hevc_qsv and libx265 (incl. 2-pass pass 2): files decode with no errors
+- Non-square pixels: `rileva_pixel_non_quadrati()` shows a warning (what SAR means, what to pick) with a
+  "Fix: Deforma + Originale" button (`_correggi_sar()`) that sets Aspect ratio = stretch, ratio = Originale
+  (and leaves "Copia stream" if "Solo correggi DAR" had selected it). Checked on a 700x480 SAR 8:9 file:
+  output 622x480, SAR 1:1; the layout was checked through widget state, not visually (screen capture
+  came out black in this session)
 - "Check original FPS" (`_verifica_fps_originali()`): finds the real content frame rate, e.g. a
   24 fps film stored as 30 with duplicated frames. `fps_contenuto()` takes 5 clips of 8 s (15/30/
   50/70/85%), scales to 320 px wide and counts the frames left by `mpdecimate` (defaults

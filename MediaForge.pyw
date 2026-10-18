@@ -351,9 +351,10 @@ def rileva_pixel_non_quadrati(video: dict) -> str:
     if not sar or sar in ("1:1", "0:1", "N/A"):
         return ""
     dar = video.get("display_aspect_ratio") or "?"
-    return (f"⚠ Pixel non quadrati (SAR {sar}, DAR {dar}): usa \"Deforma\" per una "
-            "correzione reale (funziona ovunque). \"Solo correggi DAR\" è più "
-            "veloce ma è solo un'etichetta: alcuni player la ignorano.")
+    return (f"⚠ Non-square pixels (SAR {sar}, display ratio {dar}): players that ignore this "
+            "label show the video squashed. To fix it everywhere use Aspect ratio → Deforma with "
+            "ratio \"Originale\" (re-encodes with square pixels), or press the button. "
+            "\"Solo correggi DAR\" only rewrites the label: fast, but some players ignore it.")
 
 
 QSV_ENCODERS = ("hevc_qsv", "av1_qsv")
@@ -2986,12 +2987,17 @@ class App(_BaseTk):
 
         # Riga 2d: avviso pixel non quadrati (compare solo se rilevati nel
         # file selezionato — vedi _mostra_stream/rileva_pixel_non_quadrati)
-        self._lbl_sar_avviso = ttk.Label(self._frm_video_specific, foreground="#cc6600")
+        self._frm_sar_avviso = ttk.Frame(self._frm_video_specific)
+        self._lbl_sar_avviso = ttk.Label(self._frm_sar_avviso, foreground="#cc6600")
+        self._btn_sar_fix = ttk.Button(self._frm_sar_avviso, text="Fix: Deforma + Originale",
+                                       command=self._correggi_sar)
+        self._btn_sar_fix.pack(side="right", padx=(8, 0))
+        self._lbl_sar_avviso.pack(side="left", fill="x", expand=True)
         # wraplength = larghezza attuale della label: così il testo va a capo
         # invece di spingere la finestra oltre la larghezza iniziale (si
         # aggiorna da sola anche se la finestra viene poi ridimensionata).
         self._lbl_sar_avviso.bind(
-            "<Configure>", lambda e: self._lbl_sar_avviso.configure(wraplength=e.width))
+            "<Configure>", lambda e: self._lbl_sar_avviso.configure(wraplength=max(200, e.width)))
         # Non lo pack() subito: appare/scompare dinamicamente
 
         # Riga 3: audio (sempre visibile, anche in modalità "Solo audio")
@@ -3608,9 +3614,9 @@ class App(_BaseTk):
         avviso_sar = rileva_pixel_non_quadrati(video)
         if avviso_sar:
             self._lbl_sar_avviso.configure(text=avviso_sar)
-            self._lbl_sar_avviso.pack(fill="x", padx=5, pady=(0, 3))
+            self._frm_sar_avviso.pack(fill="x", padx=5, pady=(0, 3))
         else:
-            self._lbl_sar_avviso.pack_forget()
+            self._frm_sar_avviso.pack_forget()
         self._aggiorna_quality_da_risoluzione(video)
 
         if not streams:
@@ -3916,7 +3922,7 @@ class App(_BaseTk):
         self._frm_meta.grid_remove()
         self._frm_trim.pack_forget()
         self._frm_streams.pack_forget()
-        self._lbl_sar_avviso.pack_forget()
+        self._frm_sar_avviso.pack_forget()
         self._stream_vars.clear()
         self._var_ss_on = None
         self._var_t_on  = None
@@ -4058,6 +4064,18 @@ class App(_BaseTk):
         if not self._var_limit_fps.get():
             self._fps_exact = None
         self._spin_fps.configure(state="normal" if self._var_limit_fps.get() else "disabled")
+
+    def _correggi_sar(self):
+        """Pulsante dell'avviso pixel non quadrati: imposta "Deforma" con
+        rapporto "Originale" (SAR -> 1:1, vedi costruisci_filtri_video). Deforma
+        ricodifica, quindi se era attivo "Copia stream" (lasciato da "Solo
+        correggi DAR") passa al primo encoder disponibile."""
+        if self._vcodec_id() == "copy":
+            self._var_vcodec.set(self._combo_vcodec["values"][0])
+            self._toggle_vcodec()
+        self._var_ar_mode.set("stretch")
+        self._var_ar_ratio.set("Originale")
+        self._toggle_ar()
 
     def _toggle_ar(self):
         attivo = self._var_ar_mode.get() != "nessuna"
