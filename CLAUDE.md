@@ -148,6 +148,27 @@ with it. Auto-scroll and the live progress rewrite both pause while the user has
 selection or has scrolled away from the bottom (`_log_in_fondo()`), so the log stays selectable/
 copyable (Ctrl+C) during a run instead of being yanked away by the next line.
 
+## Parity with the sibling app (desktop <-> web)
+
+`MediaForge` (desktop, `../MediaForge`) and `mediaforge-web` (`../mediaforge-web`, Docker on gaia) are separate
+codebases that must keep the same encoding rules. Status as of 2026-10-18; `mediaforge-web/tests/test_parity.py`
+enforces the "same" rows.
+
+| Rule | Desktop | Web | Status |
+|---|---|---|---|
+| Default CRF by resolution (QSV) | `QSV_CRF_POINTS` | `CRF_PUNTI` in `index.html` | same (tested through node) |
+| QSV presets | 3 levels, `hevc_qsv` only | 3 levels | same |
+| GPU decode gating | `HW_DECODE_*` | `HW_DECODE_*` | same, web also allows `mjpeg` (Linux QSV decoder) |
+| FPS check (mpdecimate on 5 clips) | `fps_contenuto()` | `detect_fps()` | same method; desktop adds a timestamp (VFR) check |
+| Stats tags cleared, `ENCODING_SETTINGS` | yes | yes | same |
+| Target bitrate, 2-pass, stop-and-keep | yes | no | to port to the web |
+| `hw_accel` per-job switch, output bitrate/size after encode | no | yes | to port to the desktop |
+| GPU path | `d3d11va` + `hwmap` | `-hwaccel qsv` | different on purpose (platform) |
+| Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
+| Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |
+
+When you change a "same" rule on one side, change the other and run both test suites.
+
 ## Conventions
 
 - Method/function names and comments are in Italian throughout (`leggi`/`aggiorna`/`carica`/
