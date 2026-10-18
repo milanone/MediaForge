@@ -1162,7 +1162,11 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         # HDR, vedi hwaccel_output_format()) e l'encoder qsv li ricarica da
         # solo. Verificato su Intel Iris Xe: 4K HDR10 10 bit → 1080p, metadati
         # HDR (mastering display/content light level) conservati.
-        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+        # extra_hw_frames: with the default pool (decoder reference frames + 2) the frames kept by the
+        # QSV encoder (look-ahead, hwmap) exhaust it and the decoder DROPS frames ("Static surface pool
+        # size exceeded", "Error submitting packet to decoder") while ffmpeg still exits with success:
+        # on a 1080p AV1 film only 1841 of 2700 frames reached the output, A/V sync was lost.
+        cmd += ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11", "-extra_hw_frames", "24"]
     if opts.get("ss"):
         cmd += ["-ss", opts["ss"]]
     cmd += ["-i", str(src)]
@@ -1626,8 +1630,14 @@ def applica_timestamp(src: Path, dst: Path, modalita: str, data: dict, log_q: qu
         log_q.put(("detail", "  Avviso: impossibile impostare la data del file"))
 
 
+# ffmpeg lines that mean the GPU decoder is dropping frames even though ffmpeg would exit with success
+GPU_DECODE_ERRORS = ("Static surface pool size exceeded", "Error submitting packet to decoder",
+                     "get_buffer() failed")
+
+
 def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading.Event,
-                                timeout_stallo: float = 5.0, finish_ev: threading.Event = None):
+                                timeout_stallo: float = 5.0, finish_ev: threading.Event = None,
+                                fatal_patterns: tuple = ()):
     """Lancia ffmpeg, inoltra al log le righe di progresso (frame/fps/time/
     speed) e di dettaglio, e ne segue l'esito. Oltre all'interruzione manuale
     (stop_ev) e al codice di uscita, rileva uno STALLO: se il valore di
@@ -1645,6 +1655,9 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
     (terminate, file scartato dal chiamante) manda "q" a ffmpeg, che finisce i
     fotogrammi in coda e scrive la chiusura del contenitore: il file parziale
     è riproducibile. stdin è quindi una pipe (valida anche sotto pythonw).
+    fatal_patterns: se una riga di ffmpeg ne contiene una, ffmpeg viene fermato subito con esito
+    "errore" (il file sarebbe danneggiato anche se ffmpeg finirebbe con codice 0): serve a far
+    scattare il ripiego in software invece di codificare per ore un video con fotogrammi persi.
     Ritorna (esito, returncode) con esito in "ok"/"interrotto"/"stallo"/"errore"/
     "terminato" (chiuso in modo pulito su richiesta di finish_ev)."""
     proc = subprocess.Popen(
@@ -1716,6 +1729,11 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
             log_q.put(("progress", line))
         elif line:
             log_q.put(("detail", "  " + line))
+        if fatal_patterns and any(pat in line for pat in fatal_patterns):
+            log_q.put(("warning", "  ⚠ The GPU decoder is dropping frames: stopping this attempt."))
+            proc.terminate()
+            esito = "errore"
+            break
 
     proc.wait()
     if esito == "terminato" and proc.returncode not in (0, 255):
@@ -1841,7 +1859,8 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
 
             esito, returncode = esegui_ffmpeg_con_watchdog(
                 cmd, log_q, stop_ev, timeout_stallo=timeout_stallo,
-                finish_ev=opts.get("finish_ev"))
+                finish_ev=opts.get("finish_ev"),
+                fatal_patterns=GPU_DECODE_ERRORS if "-hwaccel" in cmd else ())
 
             if esito == "interrotto":
                 log_q.put(("detail", "  Interrotto dall'utente."))

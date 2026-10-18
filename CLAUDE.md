@@ -72,7 +72,7 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   frames stay on the GPU: `-hwaccel d3d11va -hwaccel_output_format d3d11`, then `hwmap=derive_device=qsv,
   format=qsv` and the resolution cap as `scale_qsv=w=W:h=H` (`costruisci_filtri_video(scala_gpu=True)`;
   scale_qsv doesn't accept `-2`, so even sizes are computed in Python). Any other filter is software
-  and goes after `hwdownload,format=nv12|p010le`. GPU decoding is gated on the source
+  and goes after `hwdownload,format=nv12|p010le`. The GPU decode needs `-extra_hw_frames 24`: with the default surface pool the QSV encoder (look-ahead, hwmap) starves the decoder, which then DROPS frames while ffmpeg exits with code 0 (a 1080p AV1 film: 1841 of 2700 frames in 90 s, A/V out of sync). As a safety net `esegui_ffmpeg_con_watchdog(fatal_patterns=GPU_DECODE_ERRORS)` stops the attempt at the first decoder-error line so `converti_file()` falls back to software decoding. Verified on a 100 s excerpt: 3000/3000 frames with the fix; with the old command the attempt is stopped and the software retry gives 3000/3000 GPU decoding is gated on the source
   (`sorgente_decodificabile_hw()`: h264/hevc/av1/vp9/mpeg2/vc1, 4:2:0 8/10 bit); anything else (4:2:2,
   4:4:4, 12 bit, ProRes…) goes straight to software decoding instead of failing first. List measured
   on an N150 in the web version; mjpeg dropped from it (d3d11va has no MJPEG decoder, not tested here).

@@ -105,5 +105,36 @@ class FpsRules(unittest.TestCase):
         self.assertIn("fps=30000/1001", mf.costruisci_filtri_video(opts, video("h264", "yuv420p", 1920, 1080)))
 
 
+class GpuDecodeSafety(unittest.TestCase):
+    """The GPU path dropped 31% of the frames of a 1080p AV1 film while ffmpeg exited with success."""
+
+    @unittest.skipUnless(sys.platform == "win32", "the d3d11va path is Windows only")
+    def test_gpu_command_enlarges_the_surface_pool(self):
+        data = {"streams": [video("av1", "yuv420p", 1920, 1080)]}
+        opts = {"mode": "video", "output_ext": "mp4", "vcodec": "hevc_qsv", "quality": 22, "look_ahead": True,
+                "audio": "copy", "subs": "copy", "timestamp": "", "limite_res": None}
+        cmd = mf.build_ffmpeg_cmd(Path("in.mp4"), Path("out.mp4"), opts, data)
+        self.assertIn("-hwaccel", cmd)
+        self.assertEqual(cmd[cmd.index("-extra_hw_frames") + 1], "24")
+        self.assertLess(cmd.index("-extra_hw_frames"), cmd.index("-i"))  # an input option
+
+    def test_watchdog_stops_on_a_decoder_error_line(self):
+        import queue, threading, time
+        script = ("import sys,time\nprint('[AVHWFramesContext] Static surface pool size exceeded.', flush=True)\n"
+                  "time.sleep(30)")
+        t0 = time.time()
+        esito, _ = mf.esegui_ffmpeg_con_watchdog([sys.executable, "-c", script], queue.Queue(), threading.Event(),
+                                                  timeout_stallo=60, fatal_patterns=mf.GPU_DECODE_ERRORS)
+        self.assertEqual(esito, "errore")
+        self.assertLess(time.time() - t0, 15)
+
+    def test_watchdog_ignores_those_lines_without_patterns(self):
+        import queue, threading
+        script = "print('Static surface pool size exceeded', flush=True)"
+        esito, _ = mf.esegui_ffmpeg_con_watchdog([sys.executable, "-c", script], queue.Queue(), threading.Event(),
+                                                  timeout_stallo=60)
+        self.assertEqual(esito, "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
