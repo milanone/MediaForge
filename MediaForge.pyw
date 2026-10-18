@@ -92,6 +92,79 @@ def bitrate_video_esatto(path: Path, durata_sec: float):
         return None
 
 
+# Frequenze standard (frazione esatta) a cui agganciare il valore misurato:
+# 29.97 va scritto 30000/1001, non 30 (fps=30 su una sorgente a 29.97
+# duplicherebbe un fotogramma ogni ~33 s).
+FPS_STANDARD = ("24000/1001", "24/1", "25/1", "30000/1001", "30/1",
+                "50/1", "60000/1001", "60/1", "120/1")
+
+
+def fps_da_frazione(testo) -> float:
+    """'30000/1001' -> 29.97...; 0.0 se assente o non valida ('0/0', 'N/A')."""
+    try:
+        num, _, den = str(testo).partition("/")
+        den = float(den) if den else 1.0
+        return float(num) / den if den else 0.0
+    except ValueError:
+        return 0.0
+
+
+def analizza_fps(path: Path, video: dict):
+    """Misura la frequenza di fotogrammi REALE dai timestamp dei pacchetti
+    (ffprobe packet=pts_time, solo demuxing: pochi secondi anche su un film)
+    invece di fidarsi dell'intestazione: r_frame_rate/avg_frame_rate sono
+    spesso scritti dal contenitore o dalla camera e non dicono se il file è a
+    frequenza variabile (VFR, tipico di telefoni e screen recorder).
+    Ritorna un dict (nominale, media dichiarata, media misurata, valore
+    standard più vicino come frazione, percentuale di intervalli irregolari,
+    vfr) o None se non calcolabile."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                           encoding="utf-8", errors="replace",
+                           stdin=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        tempi = []
+        for riga in r.stdout.splitlines():
+            try:
+                tempi.append(float(riga.strip().rstrip(",")))
+            except ValueError:
+                pass
+    except Exception:
+        return None
+    if len(tempi) < 3:
+        return None
+    tempi.sort()  # l'ordine di decodifica non è quello di presentazione (B-frame)
+    durata = tempi[-1] - tempi[0]
+    if durata <= 0:
+        return None
+    media = (len(tempi) - 1) / durata
+    # Passo base = primo quartile degli intervalli: in un file a frequenza
+    # variabile con fotogrammi mancanti la media sottostima la frequenza
+    # "vera" (intervalli di 2-3 passi), mentre il quartile basso resta sul passo
+    # regolare; i millisecondi di arrotondamento dei timestamp non lo spostano.
+    intervalli = sorted(b - a for a, b in zip(tempi, tempi[1:]) if b - a > 1e-6)
+    q1 = intervalli[len(intervalli) // 4]
+    # media degli intervalli vicini al quartile: con timestamp al millisecondo
+    # (33/34 ms) il solo quartile darebbe 30.30 invece di 29.97
+    vicini = [d for d in intervalli if 0.8 * q1 < d < 1.2 * q1]
+    base = len(vicini) / sum(vicini)
+    standard = min(FPS_STANDARD, key=lambda f: abs(fps_da_frazione(f) - base))
+    if abs(fps_da_frazione(standard) - base) / base > 0.01:
+        standard = f"{round(base * 1000)}/1000"  # nessuno standard vicino: valore misurato
+    passo = 1.0 / fps_da_frazione(standard)
+    # intervallo "irregolare" = fotogramma mancante/ripetuto, non l'arrotondamento
+    # al millisecondo dei timestamp (33/34 ms): serve oltre il 50% di scarto.
+    irregolari = sum(1 for a, b in zip(tempi, tempi[1:])
+                     if not 0.5 * passo < (b - a) < 1.5 * passo)
+    pct = 100.0 * irregolari / (len(tempi) - 1)
+    return {"nominale": fps_da_frazione(video.get("r_frame_rate")),
+            "dichiarata": fps_da_frazione(video.get("avg_frame_rate")),
+            "media": media, "standard": standard,
+            "irregolari_pct": pct, "vfr": pct > 1.0}
+
+
 def video_ha_bitrate_noto(video: dict) -> bool:
     """True se lo stream video ha già un bitrate leggibile SENZA ricalcolarlo
     (campo bit_rate genuino, o tag BPS/BPS-eng): usato da _mostra_stream/
@@ -890,7 +963,7 @@ def costruisci_filtri_video(opts: dict, video: dict, warnings: list = None,
 
     # --- FPS ---
     if opts.get("limit_fps") and opts.get("fps_value", 0) > 0:
-        vf_filters.append(f"fps={opts['fps_value']}")
+        vf_filters.append(f"fps={opts.get('fps_exact') or opts['fps_value']}")
 
     # --- Flip ---
     if opts.get("hflip"):
@@ -1124,7 +1197,7 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             if ar_mode != "nessuna":
                 nota_codifica.append(f"{ar_mode} {opts.get('ar_ratio', '')}".strip())
             if opts.get("limit_fps") and opts.get("fps_value", 0) > 0:
-                nota_codifica.append(f"fps={opts['fps_value']}")
+                nota_codifica.append(f"fps={opts.get('fps_exact') or opts['fps_value']}")
             if opts.get("hflip"):
                 nota_codifica.append("hflip")
             if opts.get("vflip"):
@@ -2780,6 +2853,10 @@ class App(_BaseTk):
         ttk.Checkbutton(r2, text="Limita FPS a", variable=self._var_limit_fps,
                         command=self._toggle_fps).pack(side="left", padx=(20,4))
         self._var_fps = tk.IntVar(value=30)
+        # Frazione esatta (es. "30000/1001") impostata da "Check original FPS";
+        # si azzera se l'utente cambia a mano il valore (vedi _on_fps_var_change).
+        self._fps_exact = None
+        self._var_fps.trace_add("write", self._on_fps_var_change)
         self._spin_fps = ttk.Spinbox(r2, from_=1, to=120, textvariable=self._var_fps,
                                      width=5, state="disabled")
         self._spin_fps.pack(side="left")
@@ -3270,6 +3347,7 @@ class App(_BaseTk):
             "two_pass":   self._var_two_pass.get(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
+            "fps_exact":  self._fps_exact if self._var_limit_fps.get() else None,
             "audio":      self._var_audio.get(),
             "subs":       self._var_subs.get(),
             "timestamp":  self._var_ts.get(),
@@ -3476,6 +3554,14 @@ class App(_BaseTk):
                                    "dichiarato nel file. Se non corrisponde (es. tag stantio\n"
                                    "da una ricodifica precedente) propone di correggerlo,\n"
                                    "senza ricodificare nulla.")
+        if video is not None:
+            btn_fps = ttk.Button(btn_frame, text="🔍 Check original FPS",
+                                 command=lambda: self._verifica_fps_originali(path))
+            btn_fps.pack(side="left", padx=(0, 12))
+            Tooltip(btn_fps, "Measures the real frame rate from the packet timestamps (not just\n"
+                             "the header) and tells whether the file is constant or variable\n"
+                             "frame rate. Then sets the FPS option consistently: no limit for a\n"
+                             "constant-rate file, a constant fps (e.g. 30000/1001) for a variable one.")
         ttk.Button(btn_frame, text="Seleziona tutti", width=15,
                    command=lambda: self._imposta_tutti_stream(True)).pack(side="left", padx=(0,4))
         ttk.Button(btn_frame, text="Deseleziona tutti", width=17,
@@ -3500,6 +3586,51 @@ class App(_BaseTk):
         for var in self._stream_vars:
             var.set(valore)
         self._aggiorna_anteprima()
+
+    def _verifica_fps_originali(self, path: Path):
+        """Misura i fps reali (analizza_fps) e imposta "Limita FPS" in modo
+        coerente: sorgente a frequenza costante -> nessun filtro (si conserva
+        l'originale); variabile (VFR) -> fps costante alla frequenza standard
+        più vicina, come frazione esatta."""
+        data = self._ottieni_probe(path)
+        video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+        if not video:
+            messagebox.showinfo("Check FPS", "No video stream in this file.")
+            return
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            r = analizza_fps(path, video)
+        finally:
+            self.config(cursor="")
+        if r is None:
+            messagebox.showwarning("Check FPS", "Cannot measure the frame rate of this file.")
+            return
+        std = fps_da_frazione(r["standard"])
+        riepilogo = (f"Header: r_frame_rate {r['nominale']:.3f}, avg_frame_rate {r['dichiarata']:.3f}\n"
+                     f"Measured average: {r['media']:.3f} fps\n"
+                     f"Irregular frame intervals: {r['irregolari_pct']:.1f}%\n\n")
+        if r["vfr"]:
+            domanda = (riepilogo + f"Variable frame rate. Set a constant {std:.3f} fps ({r['standard']}) "
+                       "in the encode options?")
+        else:
+            domanda = (riepilogo + f"Constant frame rate ({std:.3f} fps). Clear the FPS limit so the "
+                       "original rate is kept?")
+        if not messagebox.askyesno("Check FPS", domanda):
+            return
+        if r["vfr"]:
+            self._var_limit_fps.set(True)
+            self._var_fps.set(max(1, round(std)))
+            self._fps_exact = r["standard"]  # dopo il set: il trace non deve azzerarla
+            self._toggle_fps_keep_exact()
+        else:
+            self._var_limit_fps.set(False)
+            self._toggle_fps()
+        self._aggiorna_anteprima()
+
+    def _toggle_fps_keep_exact(self):
+        """Come _toggle_fps ma senza azzerare la frazione esatta (limite attivo)."""
+        self._spin_fps.configure(state="normal")
 
     def _verifica_bitrate_reale(self, path: Path):
         """Ricalcola il bitrate REALE del video sommando i byte veri dei
@@ -3791,7 +3922,20 @@ class App(_BaseTk):
         per il cambio di encoder."""
         self._aggiorna_quality_da_risoluzione(self._video_singolo_selezionato())
 
+    def _on_fps_var_change(self, *_):
+        """Modifica manuale dei fps: la frazione esatta non vale più se il
+        numero intero non è più quello a cui corrispondeva."""
+        if self._fps_exact is None:
+            return
+        try:
+            if self._var_fps.get() != round(fps_da_frazione(self._fps_exact)):
+                self._fps_exact = None
+        except tk.TclError:
+            self._fps_exact = None
+
     def _toggle_fps(self):
+        if not self._var_limit_fps.get():
+            self._fps_exact = None
         self._spin_fps.configure(state="normal" if self._var_limit_fps.get() else "disabled")
 
     def _toggle_ar(self):
@@ -4143,6 +4287,7 @@ class App(_BaseTk):
             "ar_ratio":   self._var_ar_ratio.get(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
+            "fps_exact":  self._fps_exact if self._var_limit_fps.get() else None,
             "audio":      self._var_audio.get(),
             "subs":       self._var_subs.get(),
             "timestamp":  self._var_ts.get(),

@@ -47,6 +47,8 @@ control the playback side, not a safe default otherwise.
   specific file, the app retries it automatically with software decoding
 - "Stop and keep file" closes the current encode cleanly and keeps the playable partial file
   (the regular "Interrompi" button discards it)
+- "Check original FPS": measures the real frame rate from timestamps, tells constant from
+  variable frame rate (phones, screen recorders) and sets the FPS option accordingly
 - Log panel text is selectable and copyable (mouse or Ctrl+C/Ctrl+A) while staying read-only
 - Exact real video bitrate (from packet sizes, not an estimate) and two maintenance tools: fix
   the HEVC tag some players need for HEVC-in-MP4, and fix a stale/wrong bitrate tag
