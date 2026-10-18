@@ -1128,7 +1128,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         return _build_audio_cmd(src, dst, opts, streams)
     video    = next((s for s in streams if s.get("codec_type") == "video"), None)
 
-    usa_gpu = hwaccel_decode and usa_hwaccel_decode(opts.get("vcodec"), video)
+    usa_gpu = (hwaccel_decode and opts.get("gpu_decode", True)
+               and usa_hwaccel_decode(opts.get("vcodec"), video))
     vf_filters = costruisci_filtri_video(opts, video, warnings, scala_gpu=usa_gpu)
 
     # "Solo correggi DAR" + "Copia stream" (nessuna ricodifica): il filtro
@@ -1813,9 +1814,9 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
     # con l'encoder qsv scelto perfettamente funzionante).
     video_src = next((s for s in data.get("streams", [])
                       if s.get("codec_type") == "video"), None)
-    hwaccel = usa_hwaccel_decode(opts.get("vcodec"), video_src)
+    hwaccel = usa_hwaccel_decode(opts.get("vcodec"), video_src) and opts.get("gpu_decode", True)
     if (not hwaccel and usa_hwaccel_decode(opts.get("vcodec"))
-            and video_src is not None):
+            and video_src is not None and opts.get("gpu_decode", True)):
         log_q.put(("detail", f"  Decodifica GPU saltata: sorgente non supportata "
                    f"({video_src.get('codec_name')}, {video_src.get('pix_fmt')}), "
                    "decodifica software."))
@@ -1902,7 +1903,13 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
             size_src = src.stat().st_size / 1_048_576
             size_dst = dst.stat().st_size / 1_048_576
             risparmio = (1 - size_dst / size_src) * 100 if size_src else 0
-            log_q.put(("ok", f"  ✓ {dst.name}  [{size_src:.1f} MB → {size_dst:.1f} MB  {risparmio:+.0f}%]"))
+            out_br = None
+            try:
+                out_br = bitrate_video_esatto(dst, float(ffprobe_json(dst).get("format", {}).get("duration") or 0))
+            except Exception:
+                pass
+            br_txt = f"  {out_br // 1000} kbps" if out_br else ""
+            log_q.put(("ok", f"  ✓ {dst.name}  [{size_src:.1f} MB → {size_dst:.1f} MB  {risparmio:+.0f}%{br_txt}]"))
             return True
 
         except Exception as e:
@@ -2888,6 +2895,11 @@ class App(_BaseTk):
                                          textvariable=self._var_bitrate, width=7)
         self._spin_bitrate.pack(side="left")
         ttk.Label(r1b, text="kbps").pack(side="left", padx=2)
+        self._var_gpu_decode = tk.BooleanVar(value=True)
+        self._chk_gpu_decode = ttk.Checkbutton(r1b, text="GPU decoding", variable=self._var_gpu_decode)
+        self._chk_gpu_decode.pack(side="left", padx=(20,0))
+        Tooltip(self._chk_gpu_decode, "Decode (and scale to the resolution cap) on the GPU with QSV on Windows.\n"
+                "Turn it off for a job if a file misbehaves; a failed GPU attempt already falls back to software.")
         self._var_two_pass = tk.BooleanVar(value=False)
         self._chk_two_pass = ttk.Checkbutton(r1b, text="2-pass", variable=self._var_two_pass)
         self._chk_two_pass.pack(side="left", padx=(12,0))
@@ -3293,7 +3305,8 @@ class App(_BaseTk):
                     self._var_fps, self._var_audio, self._var_subs,
                     self._var_ts, self._var_res, self._var_vcodec,
                     self._var_hflip, self._var_vflip, self._var_ar_ratio,
-                    self._var_rate_mode, self._var_bitrate, self._var_two_pass):
+                    self._var_rate_mode, self._var_bitrate, self._var_two_pass,
+                    self._var_gpu_decode):
             var.trace_add("write", lambda *_: self._aggiorna_anteprima())
         # Il formato output influenza anche gli avvisi metadati
         self._var_ext.trace_add("write", lambda *_: (
@@ -3408,6 +3421,7 @@ class App(_BaseTk):
             "preset":     self._preset_id(),
             "bitrate_kbps": self._bitrate_target(),
             "two_pass":   self._var_two_pass.get(),
+            "gpu_decode": self._var_gpu_decode.get(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
             "fps_exact":  self._fps_exact if self._var_limit_fps.get() else None,
@@ -4004,6 +4018,8 @@ class App(_BaseTk):
         self._spin_quality.configure(state="disabled" if by_bitrate else state)
         self._btn_quality_auto.configure(state="disabled" if by_bitrate else "normal")
         self._spin_bitrate.configure(state=state if by_bitrate else "disabled")
+        self._chk_gpu_decode.configure(
+            state="normal" if usa_hwaccel_decode(self._vcodec_id()) else "disabled")
         self._chk_two_pass.configure(
             state="normal" if by_bitrate and self._vcodec_id() in ("libx265", "libsvtav1")
             else "disabled")
@@ -4386,6 +4402,7 @@ class App(_BaseTk):
             "preset":     self._preset_id(),
             "bitrate_kbps": self._bitrate_target(),
             "two_pass":   self._var_two_pass.get(),
+            "gpu_decode": self._var_gpu_decode.get(),
             "hflip":      self._var_hflip.get(),
             "vflip":      self._var_vflip.get(),
             "ar_mode":    self._var_ar_mode.get(),

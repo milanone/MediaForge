@@ -161,8 +161,9 @@ enforces the "same" rows.
 | GPU decode gating | `HW_DECODE_*` | `HW_DECODE_*` | same, web also allows `mjpeg` (Linux QSV decoder) |
 | FPS check (mpdecimate on 5 clips) | `fps_contenuto()` | `detect_fps()` | same method; desktop adds a timestamp (VFR) check |
 | Stats tags cleared, `ENCODING_SETTINGS` | yes | yes | same |
-| Target bitrate, 2-pass, stop-and-keep | yes | no | to port to the web |
-| `hw_accel` per-job switch, output bitrate/size after encode | no | yes | to port to the desktop |
+| Target bitrate, stop-and-keep (clean stop, partial file kept) | yes | yes | same (web: UI + `/api/finish`) |
+| 2-pass | libx265, libsvtav1 | libx265 only | same idea; QSV has no 2nd pass |
+| Per-job GPU decode switch, output bitrate/size after encode | `gpu_decode`, final log line | `hw_accel`, status message | same |
 | GPU path | `d3d11va` + `hwmap` | `-hwaccel qsv` | different on purpose (platform) |
 | Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
 | Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |
