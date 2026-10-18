@@ -173,6 +173,7 @@ enforces the "same" rows.
 | Aspect ratio: crop / pad / DAR / stretch, "Originale", SAR/DAR rules | yes | yes | same (SAR parsing, DAR first, even-size rounding tested) |
 | Non-square pixels warning with one-click fix (Deforma + Originale), warnings in the command preview | yes | yes | same |
 | Real bitrate, declared bitrate, fix of a stale bitrate tag | yes | yes | same method; the web computes the real bitrate on every probe, the desktop only when nothing is declared or on request |
+| GPU decoder drops frames (error lines in the ffmpeg log) | stops the attempt, software fallback by itself | warning in the page: continue / stop / redo in software | different on purpose (software is very slow on gaia) |
 | GPU path | `d3d11va` + `hwmap` | `-hwaccel qsv` | different on purpose (platform) |
 | Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
 | Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |
