@@ -1020,7 +1020,8 @@ def costruisci_filtri_video(opts: dict, video: dict, warnings: list = None,
                 risultato = dimensioni_target_pari(iw_eff, ih_eff, valore, ar_mode, sar)
                 if risultato:
                     w_grezza, h_grezza, w_fin, h_fin = risultato
-                    if abs(w_fin - w_grezza) > 0.01 or abs(h_fin - h_grezza) > 0.01:
+                    # only when rounding really changes the size (622.2 -> 622 is not a correction)
+                    if round(w_grezza) != w_fin or round(h_grezza) != h_fin:
                         warnings.append(
                             f"Il rapporto scelto richiederebbe {w_grezza:.0f}x{h_grezza:.0f}: "
                             f"corretto a {w_fin}x{h_fin} (servono numeri pari, richiesti dall'encoder).")
