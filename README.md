@@ -36,7 +36,8 @@ control the playback side, not a safe default otherwise.
   current machine (not just checking what it was compiled with), so the app proposes the right
   one per machine (AMF on AMD, QSV on Intel, VideoToolbox on Apple Silicon…)
 - Rate control: constant quality (CRF) or a target average bitrate in kbps (single-pass VBR,
-  verified with QSV HEVC and libx265; the AMF/NVENC/VideoToolbox/AV1 variants are untested)
+  verified with QSV HEVC and libx265; the AMF/NVENC/VideoToolbox/AV1 variants are untested),
+  with an optional 2-pass mode for the software encoders (libx265, SVT-AV1)
 - QSV (HEVC) offers 3 real preset levels (fast / normal / slow), and its default CRF follows
   measured values per resolution (480p=16, 720p=18, 1080p=20, 4K=22)
 - On Windows with a QSV encoder, decoding and the resolution-cap scaling both run on the GPU

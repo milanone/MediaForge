@@ -48,7 +48,11 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   also gets `-preset` from the 3 real QSV levels veryfast/medium/veryslow, `QSV_PRESETS`).
   The "Rate control" row switches between quality (CRF) and a target average bitrate in kbps
   (`opts["bitrate_kbps"]`, `_bitrate_target()`): `encoder_bitrate_args()` emits single-pass VBR
-  (`-b:v`, plus `-rc vbr_peak` for AMF and `-rc vbr` for NVENC; no 2-pass). Verified on real files
+  (`-b:v`, plus `-rc vbr_peak` for AMF and `-rc vbr` for NVENC). The optional "2-pass" box
+  (`usa_2_passate()`, `converti_2_passate()`) is software-only (libx265/libsvtav1; QSV/AMF/NVENC
+  have no 2nd pass): pass 1 = analysis to `-f null` with the stats file in a temp dir, then
+  `converti_file()` runs as pass 2 with `-pass 2` (measured 600 kbps target: libx265 596,
+  libsvtav1 601 two-pass vs 671 single-pass; the 2-pass quality gain itself is not measured). Verified on real files
   with `hevc_qsv` (1000/3000 kbps -> 1025/3070 measured) and `libx265`; AMF, NVENC, VideoToolbox,
   SVT-AV1 and `av1_qsv` (not working on this machine even in CRF mode) are untested
 - `crf_suggerito()` — default CRF from the selected file's resolution (higher resolution → higher

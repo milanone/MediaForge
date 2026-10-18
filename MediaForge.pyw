@@ -1090,6 +1090,10 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
         cmd += encoder_video_args(opts.get("vcodec", "hevc_qsv"),
                                   opts["quality"], opts["look_ahead"], opts.get("preset"),
                                   opts.get("bitrate_kbps"))
+        if opts.get("pass_num"):
+            # 2-pass (solo encoder software, vedi converti_2_passate): stesso
+            # comando per entrambe le passate, cambia solo -pass e la destinazione.
+            cmd += ["-pass", str(opts["pass_num"]), "-passlogfile", str(opts["passlog"])]
         _, famiglia = VIDEO_ENCODERS.get(opts.get("vcodec"), (None, "hevc"))
         video_is_hevc = famiglia == "hevc"
         if video is not None:
@@ -1106,7 +1110,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             # utile per ricordarsi in futuro come è stato prodotto il file
             # senza doverlo ririlevare da MediaInfo o tenerne nota a parte.
             nota_codifica = [f"{opts.get('vcodec')} " + (
-                f"bitrate={opts['bitrate_kbps']}k" if opts.get("bitrate_kbps")
+                f"bitrate={opts['bitrate_kbps']}k" + (" 2-pass" if opts.get("pass_num") else "")
+                if opts.get("bitrate_kbps")
                 else f"CRF={opts['quality']}")]
             if opts.get("look_ahead") and opts.get("vcodec") not in (
                     "libx265", "libsvtav1", "hevc_videotoolbox"):
@@ -1201,7 +1206,12 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
 
             cmd += ["-c:s", sub_codec]
 
-    cmd.append(str(dst))
+    if opts.get("pass_num") == 1:
+        # 1a passata: solo analisi, il video non viene scritto (audio e
+        # sottotitoli non servono).
+        cmd += ["-an", "-sn", "-f", "null", os.devnull]
+    else:
+        cmd.append(str(dst))
     return cmd
 
 
@@ -1573,8 +1583,48 @@ def esegui_postmux_sottotitoli(src: Path, encoded_path: Path, data: dict, opts: 
     return True
 
 
+def usa_2_passate(opts: dict) -> bool:
+    """True se la codifica va fatta in 2 passate: serve il bitrate target, la
+    casella attiva e un encoder software (QSV/AMF/NVENC non hanno la 2a passata)."""
+    return bool(opts.get("two_pass") and opts.get("bitrate_kbps")
+                and opts.get("vcodec") in ("libx265", "libsvtav1")
+                and opts.get("mode", "video") == "video")
+
+
+def converti_2_passate(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.Event,
+                        timeout_stallo: float) -> bool:
+    """1a passata di analisi (nessun output) e poi converti_file con -pass 2: la
+    2a passata riusa tutta la logica esistente (sottotitoli, stallo, timestamp).
+    Il file di statistiche sta in una cartella temporanea rimossa a fine lavoro."""
+    log_q.put(("info", f"\n▶ {src.name}"))
+    tmp = Path(tempfile.mkdtemp(prefix="mediaforge_pass_"))
+    try:
+        opts2 = dict(opts, pass_num=2, passlog=str(tmp / "pass"))
+        data = ffprobe_json(src)
+        warnings = []
+        # sottotitoli esclusi: l'analisi riguarda solo il video
+        cmd = build_ffmpeg_cmd(src, src, dict(opts2, pass_num=1, subs="no"), data, warnings,
+                               hwaccel_decode=False)
+        log_q.put(("detail", "  Pass 1/2 (analysis)"))
+        log_q.put(("cmd", "  $ " + " ".join(cmd)))
+        esito, returncode = esegui_ffmpeg_con_watchdog(
+            cmd, log_q, stop_ev, timeout_stallo=timeout_stallo)
+        if esito == "interrotto":
+            log_q.put(("detail", "  Interrotto dall'utente."))
+            return False
+        if esito != "ok":
+            log_q.put(("error", f"  ✗ Pass 1 failed ({esito}, code {returncode})"))
+            return False
+        log_q.put(("detail", "  Pass 2/2 (encode)"))
+        return converti_file(src, opts2, log_q, stop_ev, timeout_stallo)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.Event,
                    timeout_stallo: float = 5.0) -> bool:
+    if usa_2_passate(opts) and not opts.get("pass_num"):
+        return converti_2_passate(src, opts, log_q, stop_ev, timeout_stallo)
     ext = opts["output_ext"]
     dst = src.parent / f"{src.stem}_enc.{ext}"
 
@@ -2661,6 +2711,12 @@ class App(_BaseTk):
                                          textvariable=self._var_bitrate, width=7)
         self._spin_bitrate.pack(side="left")
         ttk.Label(r1b, text="kbps").pack(side="left", padx=2)
+        self._var_two_pass = tk.BooleanVar(value=False)
+        self._chk_two_pass = ttk.Checkbutton(r1b, text="2-pass", variable=self._var_two_pass)
+        self._chk_two_pass.pack(side="left", padx=(12,0))
+        Tooltip(self._chk_two_pass, "Two passes: better bit distribution at the same average "
+                "bitrate, but about twice the time.\nOnly for software encoders (libx265, "
+                "libsvtav1): QSV/AMF/NVENC have no 2nd pass.")
         Tooltip(self._spin_bitrate, "Average video bitrate (single-pass VBR, no 2-pass): the file "
                 "size is predictable but quality varies with the content. "
                 "Audio is not included.")
@@ -3050,7 +3106,7 @@ class App(_BaseTk):
                     self._var_fps, self._var_audio, self._var_subs,
                     self._var_ts, self._var_res, self._var_vcodec,
                     self._var_hflip, self._var_vflip, self._var_ar_ratio,
-                    self._var_rate_mode, self._var_bitrate):
+                    self._var_rate_mode, self._var_bitrate, self._var_two_pass):
             var.trace_add("write", lambda *_: self._aggiorna_anteprima())
         # Il formato output influenza anche gli avvisi metadati
         self._var_ext.trace_add("write", lambda *_: (
@@ -3164,6 +3220,7 @@ class App(_BaseTk):
             "look_ahead": self._var_lookahead.get(),
             "preset":     self._preset_id(),
             "bitrate_kbps": self._bitrate_target(),
+            "two_pass":   self._var_two_pass.get(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
             "audio":      self._var_audio.get(),
@@ -3664,6 +3721,9 @@ class App(_BaseTk):
         self._spin_quality.configure(state="disabled" if by_bitrate else state)
         self._btn_quality_auto.configure(state="disabled" if by_bitrate else "normal")
         self._spin_bitrate.configure(state=state if by_bitrate else "disabled")
+        self._chk_two_pass.configure(
+            state="normal" if by_bitrate and self._vcodec_id() in ("libx265", "libsvtav1")
+            else "disabled")
         # look-ahead non ha effetto su libx265/libsvtav1 (interno) né su VideoToolbox
         la_state = ("normal" if encode and self._vcodec_id()
                     not in ("libx265", "libsvtav1", "hevc_videotoolbox") else "disabled")
@@ -4029,6 +4089,7 @@ class App(_BaseTk):
             "look_ahead": self._var_lookahead.get(),
             "preset":     self._preset_id(),
             "bitrate_kbps": self._bitrate_target(),
+            "two_pass":   self._var_two_pass.get(),
             "hflip":      self._var_hflip.get(),
             "vflip":      self._var_vflip.get(),
             "ar_mode":    self._var_ar_mode.get(),
