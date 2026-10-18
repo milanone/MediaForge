@@ -165,6 +165,69 @@ def analizza_fps(path: Path, video: dict):
             "irregolari_pct": pct, "vfr": pct > 1.0}
 
 
+# Spezzoni su cui contare i fotogrammi "veri" (percentuali del film), durata
+# di ciascuno e soglie: 4% di tolleranza dallo standard, 7% minimo di scarto
+# rispetto al dichiarato per proporre la correzione.
+FPS_CONTENUTO_POSIZIONI = (0.15, 0.30, 0.50, 0.70, 0.85)
+FPS_CONTENUTO_SEC = 8.0
+FPS_TOLLERANZA_STANDARD = 0.04
+FPS_SCARTO_MINIMO = 0.07
+
+
+def fps_contenuto(path: Path, durata_sec: float):
+    """Frequenza REALE del contenuto (non quella dichiarata): un file a 30 fps
+    può derivare da una sorgente a 24/25 con fotogrammi duplicati. Su 5
+    spezzoni da 8 s (15/30/50/70/85% del film) il video è ridotto a 320 px di
+    larghezza (il rumore di compressione pesa meno) e passato in mpdecimate
+    con le soglie di default (hi=768, lo=320, frac=0.33): scarta un
+    fotogramma se rispetto all'ultimo tenuto nessun blocco 8x8 supera hi e
+    meno di un terzo supera lo. I fotogrammi rimasti / secondi dello
+    spezzone sono i fps dello spezzone; si prende il MASSIMO dei 5, perché le
+    scene quasi ferme possono solo far scartare fotogrammi in più, mai in
+    meno. Ritorna (fps massimi, lista dei fps per spezzone) o None se non
+    calcolabile. -fps_mode passthrough: senza, il muxer null duplicherebbe i
+    fotogrammi scartati e il conteggio sarebbe falsato."""
+    if not durata_sec or durata_sec <= 0:
+        return None
+    clip = min(FPS_CONTENUTO_SEC, durata_sec / 6)
+    valori = []
+    for pos in FPS_CONTENUTO_POSIZIONI:
+        inizio = max(0.0, min(durata_sec * pos, durata_sec - clip))
+        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{inizio:.3f}", "-t", f"{clip:.3f}",
+               "-i", str(path), "-an", "-sn", "-map", "0:v:0",
+               "-vf", "scale=320:-2,mpdecimate=hi=768:lo=320:frac=0.33",
+               "-fps_mode", "passthrough", "-progress", "pipe:1", "-f", "null", os.devnull]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                               encoding="utf-8", errors="replace",
+                               stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            return None
+        frames = re.findall(r"^frame=(\d+)", r.stdout, re.M)
+        if r.returncode != 0 or not frames:
+            return None
+        valori.append(int(frames[-1]) / clip)
+    return max(valori), valori
+
+
+def fps_standard_vicino(fps: float, dichiarati: float = 0.0):
+    """(frazione standard più vicina, scarto relativo) tra FPS_STANDARD.
+    Con i fps dichiarati si preferisce la stessa famiglia (x/1001 se il file
+    dichiara 59.94, interi altrimenti): 30.1 fps di contenuto in un file a
+    59.94 sono 29.97, non 30, a meno che la famiglia non sia fuori tolleranza."""
+    def migliore(candidati):
+        std = min(candidati, key=lambda f: abs(fps_da_frazione(f) - fps))
+        return std, abs(fps_da_frazione(std) - fps) / fps_da_frazione(std)
+    if dichiarati:
+        ntsc = abs(dichiarati - round(dichiarati)) > 0.01
+        famiglia = [f for f in FPS_STANDARD if ("/1001" in f) == ntsc]
+        std, scarto = migliore(famiglia)
+        if scarto <= FPS_TOLLERANZA_STANDARD:
+            return std, scarto
+    return migliore(FPS_STANDARD)
+
+
 def video_ha_bitrate_noto(video: dict) -> bool:
     """True se lo stream video ha già un bitrate leggibile SENZA ricalcolarlo
     (campo bit_rate genuino, o tag BPS/BPS-eng): usato da _mostra_stream/
@@ -3558,10 +3621,9 @@ class App(_BaseTk):
             btn_fps = ttk.Button(btn_frame, text="🔍 Check original FPS",
                                  command=lambda: self._verifica_fps_originali(path))
             btn_fps.pack(side="left", padx=(0, 12))
-            Tooltip(btn_fps, "Measures the real frame rate from the packet timestamps (not just\n"
-                             "the header) and tells whether the file is constant or variable\n"
-                             "frame rate. Then sets the FPS option consistently: no limit for a\n"
-                             "constant-rate file, a constant fps (e.g. 30000/1001) for a variable one.")
+            Tooltip(btn_fps, "Counts the real (non-duplicated) frames on 5 short clips and compares\n"
+                             "them with the declared rate: e.g. a 24 fps film stored as 30 fps\n"
+                             "with repeated frames. Then sets the FPS limit consistently.")
         ttk.Button(btn_frame, text="Seleziona tutti", width=15,
                    command=lambda: self._imposta_tutti_stream(True)).pack(side="left", padx=(0,4))
         ttk.Button(btn_frame, text="Deseleziona tutti", width=17,
@@ -3588,40 +3650,83 @@ class App(_BaseTk):
         self._aggiorna_anteprima()
 
     def _verifica_fps_originali(self, path: Path):
-        """Misura i fps reali (analizza_fps) e imposta "Limita FPS" in modo
-        coerente: sorgente a frequenza costante -> nessun filtro (si conserva
-        l'originale); variabile (VFR) -> fps costante alla frequenza standard
-        più vicina, come frazione esatta."""
+        """Conta i fotogrammi VERI del contenuto (fps_contenuto, mpdecimate su 5
+        spezzoni) e li confronta con i fps dichiarati: se il contenuto è
+        molto sotto (es. 24 fps duplicati a 30) propone "Limita FPS" alla
+        frequenza standard vicina, come frazione esatta; altrimenti conserva
+        l'originale. Il controllo sui timestamp (analizza_fps) resta come
+        informazione: un file a frequenza variabile (VFR) non ha comunque
+        una frequenza "vera" unica."""
         data = self._ottieni_probe(path)
         video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
         if not video:
             messagebox.showinfo("Check FPS", "No video stream in this file.")
             return
-        self.config(cursor="watch")
-        self.update_idletasks()
         try:
-            r = analizza_fps(path, video)
-        finally:
-            self.config(cursor="")
-        if r is None:
+            durata = float(data.get("format", {}).get("duration") or 0)
+        except ValueError:
+            durata = 0.0
+        dichiarati = (fps_da_frazione(video.get("avg_frame_rate"))
+                      or fps_da_frazione(video.get("r_frame_rate")))
+        self.config(cursor="watch")
+
+        # Il thread non tocca Tk (self.after da un thread secondario non è
+        # sicuro): deposita l'esito in una coda che la GUI legge a intervalli.
+        esito_q = queue.Queue()
+
+        def misura():
+            try:
+                esito_q.put((fps_contenuto(path, durata), analizza_fps(path, video)))
+            except Exception:
+                esito_q.put((None, None))
+
+        def attendi():
+            try:
+                esito = esito_q.get_nowait()
+            except queue.Empty:
+                self.after(150, attendi)
+                return
+            self._fps_misurati(path, video, dichiarati, *esito)
+
+        threading.Thread(target=misura, daemon=True).start()
+        self.after(150, attendi)
+
+    def _fps_misurati(self, path: Path, video: dict, dichiarati: float, contenuto, tempi):
+        """Seconda metà di _verifica_fps_originali, nel thread della GUI."""
+        self.config(cursor="")
+        if contenuto is None or not dichiarati:
             messagebox.showwarning("Check FPS", "Cannot measure the frame rate of this file.")
             return
-        std = fps_da_frazione(r["standard"])
-        riepilogo = (f"Header: r_frame_rate {r['nominale']:.3f}, avg_frame_rate {r['dichiarata']:.3f}\n"
-                     f"Measured average: {r['media']:.3f} fps\n"
-                     f"Irregular frame intervals: {r['irregolari_pct']:.1f}%\n\n")
-        if r["vfr"]:
-            domanda = (riepilogo + f"Variable frame rate. Set a constant {std:.3f} fps ({r['standard']}) "
-                       "in the encode options?")
+        massimo, per_spezzone = contenuto
+        std, scarto = fps_standard_vicino(massimo, dichiarati)
+        std_val = fps_da_frazione(std)
+        vfr = bool(tempi and tempi["vfr"])
+        riepilogo = (f"Declared: {dichiarati:.3f} fps\n"
+                     f"Real content (max of 5 clips): {massimo:.2f} fps  "
+                     f"[{', '.join(f'{v:.1f}' for v in per_spezzone)}]\n")
+        if tempi:
+            riepilogo += ("Timestamps: " + (f"variable frame rate ({tempi['irregolari_pct']:.0f}% "
+                          "irregular intervals)" if vfr else "constant frame rate") + "\n")
+        riepilogo += "\n"
+        proposta = scarto <= FPS_TOLLERANZA_STANDARD and dichiarati >= std_val * (1 + FPS_SCARTO_MINIMO)
+        if proposta:
+            domanda = (riepilogo + f"The content looks like {std_val:.3f} fps ({std}) with duplicated "
+                       f"frames. Set FPS limit to {std}?")
+            azione = "limit"
+        elif vfr and tempi:
+            domanda = (riepilogo + f"No duplicated frames, but the rate is variable. Set a constant "
+                       f"{fps_da_frazione(tempi['standard']):.3f} fps ({tempi['standard']})?")
+            azione = "vfr"
         else:
-            domanda = (riepilogo + f"Constant frame rate ({std:.3f} fps). Clear the FPS limit so the "
-                       "original rate is kept?")
+            domanda = riepilogo + "The content matches the declared rate. Clear the FPS limit?"
+            azione = "clear"
         if not messagebox.askyesno("Check FPS", domanda):
             return
-        if r["vfr"]:
+        if azione in ("limit", "vfr"):
+            frazione = std if azione == "limit" else tempi["standard"]
             self._var_limit_fps.set(True)
-            self._var_fps.set(max(1, round(std)))
-            self._fps_exact = r["standard"]  # dopo il set: il trace non deve azzerarla
+            self._var_fps.set(max(1, round(fps_da_frazione(frazione))))
+            self._fps_exact = frazione  # dopo il set: il trace non deve azzerarla
             self._toggle_fps_keep_exact()
         else:
             self._var_limit_fps.set(False)

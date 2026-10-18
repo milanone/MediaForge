@@ -85,14 +85,19 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   subtitles are not added to a partial file; stopping during 2-pass pass 1 keeps nothing; if ffmpeg
   doesn't close within 30 s it is terminated and the file discarded. Tested on mkv/mp4 with
   hevc_qsv and libx265 (incl. 2-pass pass 2): files decode with no errors
-- "Check original FPS" (`_verifica_fps_originali()`, `analizza_fps()`): measures the real frame
-  rate from packet timestamps (`packet=pts_time`), not the header, which says nothing about
-  variable frame rate. Base step = mean of the intervals near the first quartile, snapped to
-  `FPS_STANDARD` as an exact fraction (29.97 -> `30000/1001`, so `fps=` doesn't duplicate frames);
-  VFR = more than 1% of intervals off by over 50%. CFR file -> clears "Limita FPS"; VFR -> sets it
-  to the base rate (`self._fps_exact`, passed as `opts["fps_exact"]`, cleared if the user edits the
-  number). Tested on synthetic CFR (25, 23.976, 29.97, B-frames) and VFR files only, not on real
-  phone footage
+- "Check original FPS" (`_verifica_fps_originali()`): finds the real content frame rate, e.g. a
+  24 fps film stored as 30 with duplicated frames. `fps_contenuto()` takes 5 clips of 8 s (15/30/
+  50/70/85%), scales to 320 px wide and counts the frames left by `mpdecimate` (defaults
+  hi=768/lo=320/frac=0.33, `-fps_mode passthrough`), keeps the MAX of the 5 (near-still scenes can
+  only drop more frames). If it is within 4% of a `FPS_STANDARD` rate and the declared rate is at
+  least 7% higher, it proposes "Limita FPS" at that standard as an exact fraction (29.97 ->
+  `30000/1001`; same family, x/1001 or integer, as the declared rate), passed as
+  `opts["fps_exact"]` (`self._fps_exact`, cleared if the user edits the number). Otherwise it
+  offers to clear the limit. `analizza_fps()` (packet timestamps) only adds a constant/variable
+  frame rate line and, with no duplicates but VFR, offers a constant rate. Runs in a thread and
+  hands the result to the GUI through a queue (`self.after` from a thread is not safe). Takes
+  ~10 s on a 60 s file. Tested on synthetic files only (24->30, 25->50, 29.97->59.94 duplicates,
+  true 30, VFR), not on real footage
 - `converti_file()` / `worker()` — runs conversion in a background thread, streaming log lines
   back to the UI via a `queue.Queue`
 - `esegui_ffmpeg_con_watchdog()` — runs one ffmpeg attempt and detects a STALL (`time=` in the
