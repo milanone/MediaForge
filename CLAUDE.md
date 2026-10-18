@@ -78,6 +78,13 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   on an N150 in the web version; mjpeg dropped from it (d3d11va has no MJPEG decoder, not tested here).
   `converti_file()` retries without hwaccel
   (plain software chain) if the GPU path fails on a file
+- "Stop and keep file" (`_termina_e_tieni()`, `opts["finish_ev"]`): unlike "Interrompi" (terminate,
+  partial output deleted) it sends `q` to ffmpeg's stdin (so stdin is a pipe in
+  `esegui_ffmpeg_con_watchdog()`, outcome `"terminato"`), which flushes the encoder and writes the
+  container trailer: the partial file is kept and plays. Remaining files are skipped; postmuxed
+  subtitles are not added to a partial file; stopping during 2-pass pass 1 keeps nothing; if ffmpeg
+  doesn't close within 30 s it is terminated and the file discarded. Tested on mkv/mp4 with
+  hevc_qsv and libx265 (incl. 2-pass pass 2): files decode with no errors
 - `converti_file()` / `worker()` — runs conversion in a background thread, streaming log lines
   back to the UI via a `queue.Queue`
 - `esegui_ffmpeg_con_watchdog()` — runs one ffmpeg attempt and detects a STALL (`time=` in the

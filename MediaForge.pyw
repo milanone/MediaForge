@@ -1488,7 +1488,7 @@ def applica_timestamp(src: Path, dst: Path, modalita: str, data: dict, log_q: qu
 
 
 def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading.Event,
-                                timeout_stallo: float = 5.0):
+                                timeout_stallo: float = 5.0, finish_ev: threading.Event = None):
     """Lancia ffmpeg, inoltra al log le righe di progresso (frame/fps/time/
     speed) e di dettaglio, e ne segue l'esito. Oltre all'interruzione manuale
     (stop_ev) e al codice di uscita, rileva uno STALLO: se il valore di
@@ -1502,10 +1502,15 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
     La lettura dello stdout avviene in un thread separato: leggere riga per
     riga bloccherebbe altrimenti il controllo periodico dello stallo proprio
     nel caso che deve rilevare, quello in cui non arriva più nessuna riga.
-    Ritorna (esito, returncode) con esito in "ok"/"interrotto"/"stallo"/"errore"."""
+    finish_ev (opzionale): "chiudi e tieni il file". A differenza di stop_ev
+    (terminate, file scartato dal chiamante) manda "q" a ffmpeg, che finisce i
+    fotogrammi in coda e scrive la chiusura del contenitore: il file parziale
+    è riproducibile. stdin è quindi una pipe (valida anche sotto pythonw).
+    Ritorna (esito, returncode) con esito in "ok"/"interrotto"/"stallo"/"errore"/
+    "terminato" (chiuso in modo pulito su richiesta di finish_ev)."""
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
     )
@@ -1522,7 +1527,23 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
     ultimo_progresso = time.monotonic()
     ultimo_valore_time = None
     esito = "ok"
+    chiusura_richiesta = None  # istante in cui è stato mandato "q"
     while True:
+        if (finish_ev is not None and finish_ev.is_set() and chiusura_richiesta is None
+                and not stop_ev.is_set()):
+            try:
+                proc.stdin.write("q")
+                proc.stdin.flush()
+            except OSError:
+                pass
+            chiusura_richiesta = time.monotonic()
+            esito = "terminato"
+            log_q.put(("detail", "  Closing the file cleanly…"))
+        if chiusura_richiesta is not None and time.monotonic() - chiusura_richiesta > 30:
+            # ffmpeg non ha chiuso entro 30 s: lo si termina, il file non è affidabile
+            proc.terminate()
+            esito = "interrotto"
+            break
         if stop_ev.is_set():
             # Termina subito il processo ffmpeg in corso, non solo la coda dei
             # file successivi: prima "Interrompi" agiva solo tra un file e
@@ -1538,7 +1559,7 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
         # timestamp corrotto) — in quel caso la coda non resta MAI vuota per
         # un secondo pieno, quindi il controllo dentro "except queue.Empty"
         # da solo non scatterebbe mai, anche con "time=" fermo da minuti.
-        if time.monotonic() - ultimo_progresso > timeout_stallo:
+        if chiusura_richiesta is None and time.monotonic() - ultimo_progresso > timeout_stallo:
             proc.terminate()
             esito = "stallo"
             break
@@ -1558,6 +1579,8 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
             log_q.put(("detail", "  " + line))
 
     proc.wait()
+    if esito == "terminato" and proc.returncode not in (0, 255):
+        esito = "errore"
     if esito == "ok" and proc.returncode != 0:
         esito = "errore"
     return esito, proc.returncode
@@ -1608,9 +1631,13 @@ def converti_2_passate(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threa
         log_q.put(("detail", "  Pass 1/2 (analysis)"))
         log_q.put(("cmd", "  $ " + " ".join(cmd)))
         esito, returncode = esegui_ffmpeg_con_watchdog(
-            cmd, log_q, stop_ev, timeout_stallo=timeout_stallo)
+            cmd, log_q, stop_ev, timeout_stallo=timeout_stallo,
+            finish_ev=opts.get("finish_ev"))
         if esito == "interrotto":
             log_q.put(("detail", "  Interrotto dall'utente."))
+            return False
+        if esito == "terminato":
+            log_q.put(("detail", "  Stopped during pass 1: nothing to keep yet."))
             return False
         if esito != "ok":
             log_q.put(("error", f"  ✗ Pass 1 failed ({esito}, code {returncode})"))
@@ -1674,12 +1701,25 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
             log_q.put(("cmd", "  $ " + " ".join(cmd)))
 
             esito, returncode = esegui_ffmpeg_con_watchdog(
-                cmd, log_q, stop_ev, timeout_stallo=timeout_stallo)
+                cmd, log_q, stop_ev, timeout_stallo=timeout_stallo,
+                finish_ev=opts.get("finish_ev"))
 
             if esito == "interrotto":
                 log_q.put(("detail", "  Interrotto dall'utente."))
                 dst_encode.unlink(missing_ok=True)  # rimuove l'output parziale/incompleto
                 return False
+
+            if esito == "terminato":
+                # Chiusura pulita richiesta dall'utente: si tiene il file
+                # parziale. I sottotitoli posticipati non si aggiungono (sono
+                # lunghi quanto l'originale e allungherebbero il file).
+                if posticipa_subs:
+                    log_q.put(("warning", "  ⚠ Subtitles not added to the partial file."))
+                    os.replace(dst_encode, dst)
+                applica_timestamp(src, dst, opts["timestamp"], data, log_q)
+                size_dst = dst.stat().st_size / 1_048_576
+                log_q.put(("ok", f"  ⏹ Stopped on request, partial file kept: {dst.name}  [{size_dst:.1f} MB]"))
+                return True
 
             if esito == "stallo":
                 if not posticipa_subs and not subs_gia_riprovati_per_stallo and subs_scelti != "no":
@@ -1739,7 +1779,7 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
 def worker(files: list, opts: dict, log_q: queue.Queue, stop_ev: threading.Event):
     ok = err = 0
     for f in files:
-        if stop_ev.is_set():
+        if stop_ev.is_set() or (opts.get("finish_ev") is not None and opts["finish_ev"].is_set()):
             log_q.put(("detail", "\nConversione interrotta dall'utente."))
             break
         if converti_file(f, opts, log_q, stop_ev):
@@ -2436,6 +2476,7 @@ class App(_BaseTk):
 
         self._all_files: list[Path] = []
         self._stop_ev   = threading.Event()
+        self._finish_ev = threading.Event()
         self._log_q     = queue.Queue()
         self._stream_vars: list[tk.BooleanVar] = []
         self._probe_cache: dict = {}  # str(path) -> dati ffprobe, vedi _ottieni_probe
@@ -2918,6 +2959,12 @@ class App(_BaseTk):
         self._btn_start.pack(side="left")
         self._btn_stop = ttk.Button(frm_run, text="⏹  Interrompi", command=self._interrompi, state="disabled")
         self._btn_stop.pack(side="left", padx=8)
+        self._btn_finish = ttk.Button(frm_run, text="⏹  Stop and keep file", command=self._termina_e_tieni,
+                                      state="disabled")
+        self._btn_finish.pack(side="left")
+        Tooltip(self._btn_finish, "Stops the current encode, closes the output file cleanly and keeps "
+                "what has been encoded so far (playable). Remaining files are skipped. "
+                "\"Interrompi\" instead discards the partial file.")
         self._lbl_stato = ttk.Label(frm_run, text="")
         self._lbl_stato.pack(side="left", padx=10)
 
@@ -4122,10 +4169,13 @@ class App(_BaseTk):
         self._log_write("info", f"Inizio conversione: {len(files)} file\n")
 
         self._stop_ev.clear()
+        self._finish_ev.clear()
+        opts["finish_ev"] = self._finish_ev
         self._active_op = "codifica"
         self._previeni_sospensione()
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
+        self._btn_finish.configure(state="normal")
         self._lbl_stato.config(text="In corso…")
 
         threading.Thread(
@@ -4133,6 +4183,13 @@ class App(_BaseTk):
             args=(files, opts, self._log_q, self._stop_ev),
             daemon=True
         ).start()
+
+    def _termina_e_tieni(self):
+        """Chiude pulitamente la codifica in corso e tiene il file parziale
+        (vedi esegui_ffmpeg_con_watchdog, finish_ev)."""
+        self._finish_ev.set()
+        self._btn_finish.configure(state="disabled")
+        self._lbl_stato.config(text="Closing file…")
 
     def _interrompi(self):
         self._stop_ev.set()
@@ -4873,6 +4930,7 @@ class App(_BaseTk):
                     else:
                         self._btn_start.configure(state="normal")
                         self._btn_stop.configure(state="disabled")
+                        self._btn_finish.configure(state="disabled")
                         self._lbl_stato.config(text="Completato")
                     self._active_op = None
                     self._ripristina_sospensione()

@@ -45,6 +45,8 @@ control the playback side, not a safe default otherwise.
   files keeping their color depth and HDR metadata; other filters (crop/pad/fps/flip) are
   software and only then pull the frames back to system memory. If hardware decoding fails on a
   specific file, the app retries it automatically with software decoding
+- "Stop and keep file" closes the current encode cleanly and keeps the playable partial file
+  (the regular "Interrompi" button discards it)
 - Log panel text is selectable and copyable (mouse or Ctrl+C/Ctrl+A) while staying read-only
 - Exact real video bitrate (from packet sizes, not an estimate) and two maintenance tools: fix
   the HEVC tag some players need for HEVC-in-MP4, and fix a stale/wrong bitrate tag
