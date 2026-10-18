@@ -547,8 +547,13 @@ def dimensioni_target_pari(iw: float, ih: float, rapporto: float, modo: str, sar
     return w_grezza, h_grezza, arrotonda(w_grezza), arrotonda(h_grezza)
 
 
-def encoder_video_args(encoder: str, quality, look_ahead: bool, preset: str = None) -> list:
-    """Argomenti ffmpeg specifici per l'encoder scelto (qualità 1=max … 51=min)."""
+def encoder_video_args(encoder: str, quality, look_ahead: bool, preset: str = None,
+                       bitrate_kbps: int = None) -> list:
+    """Argomenti ffmpeg specifici per l'encoder scelto (qualità 1=max … 51=min).
+    Con bitrate_kbps la qualità è ignorata e si codifica a bitrate medio
+    target (vedi encoder_bitrate_args)."""
+    if bitrate_kbps:
+        return encoder_bitrate_args(encoder, bitrate_kbps, look_ahead, preset)
     q = str(quality)
     if encoder == "hevc_qsv":
         args = ["-c:v", "hevc_qsv", "-global_quality", q]
@@ -594,6 +599,32 @@ def encoder_video_args(encoder: str, quality, look_ahead: bool, preset: str = No
         args = ["-c:v", "libsvtav1", "-crf", q, "-preset", "6"]
     else:
         args = ["-c:v", encoder, "-global_quality", q]
+    return args
+
+
+def encoder_bitrate_args(encoder: str, kbps: int, look_ahead: bool, preset: str = None) -> list:
+    """Come encoder_video_args ma a bitrate medio target (VBR a singolo passaggio,
+    nessun 2-pass: QSV/AMF/NVENC non lo offrono). Stessi flag di look-ahead/preset
+    della modalità qualità; cambia solo il rate control."""
+    b = f"{int(kbps)}k"
+    args = ["-c:v", encoder, "-b:v", b]
+    if encoder == "hevc_qsv" and preset in dict(QSV_PRESETS):
+        args += ["-preset", preset]
+    if encoder in ("hevc_qsv", "av1_qsv") and look_ahead:
+        args += ["-look_ahead", "1"]
+    elif encoder in ("hevc_amf", "av1_amf"):
+        # senza -rc esplicito AMF usa il suo default (spesso CQP, che ignora -b:v)
+        args += ["-rc", "vbr_peak"]
+        if look_ahead:
+            args += ["-preanalysis", "1"]
+    elif encoder in ("hevc_nvenc", "av1_nvenc"):
+        args += ["-rc", "vbr"]
+        if look_ahead:
+            args += ["-rc-lookahead", "20"]
+    elif encoder == "libx265":
+        args += ["-preset", "medium"]
+    elif encoder == "libsvtav1":
+        args += ["-preset", "6"]
     return args
 
 
@@ -1057,7 +1088,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
                 cmd += ["-metadata:s:v:0", f"{tag}="]
     else:
         cmd += encoder_video_args(opts.get("vcodec", "hevc_qsv"),
-                                  opts["quality"], opts["look_ahead"], opts.get("preset"))
+                                  opts["quality"], opts["look_ahead"], opts.get("preset"),
+                                  opts.get("bitrate_kbps"))
         _, famiglia = VIDEO_ENCODERS.get(opts.get("vcodec"), (None, "hevc"))
         video_is_hevc = famiglia == "hevc"
         if video is not None:
@@ -1073,7 +1105,9 @@ def build_ffmpeg_cmd(src: Path, dst: Path, opts: dict, data: dict, warnings: lis
             # risoluzione, aspect ratio, fps, flip, poi l'audio più sotto):
             # utile per ricordarsi in futuro come è stato prodotto il file
             # senza doverlo ririlevare da MediaInfo o tenerne nota a parte.
-            nota_codifica = [f"{opts.get('vcodec')} CRF={opts['quality']}"]
+            nota_codifica = [f"{opts.get('vcodec')} " + (
+                f"bitrate={opts['bitrate_kbps']}k" if opts.get("bitrate_kbps")
+                else f"CRF={opts['quality']}")]
             if opts.get("look_ahead") and opts.get("vcodec") not in (
                     "libx265", "libsvtav1", "hevc_videotoolbox"):
                 nota_codifica.append("look-ahead")
@@ -2614,6 +2648,23 @@ class App(_BaseTk):
         ttk.Combobox(r1, textvariable=self._var_ext, values=ESTENSIONI_OUTPUT,
                      width=6, state="readonly").pack(side="left", padx=4)
 
+        # Riga 1b: rate control (qualità costante oppure bitrate medio target)
+        r1b = ttk.Frame(self._frm_video_specific); r1b.pack(fill="x", padx=5, pady=3)
+        ttk.Label(r1b, text="Rate control:").pack(side="left")
+        self._var_rate_mode = tk.StringVar(value="crf")
+        ttk.Radiobutton(r1b, text="Quality (CRF)", variable=self._var_rate_mode,
+                        value="crf", command=self._toggle_vcodec).pack(side="left", padx=6)
+        ttk.Radiobutton(r1b, text="Target bitrate", variable=self._var_rate_mode,
+                        value="bitrate", command=self._toggle_vcodec).pack(side="left", padx=6)
+        self._var_bitrate = tk.StringVar(value="2000")
+        self._spin_bitrate = ttk.Spinbox(r1b, from_=100, to=100000, increment=100,
+                                         textvariable=self._var_bitrate, width=7)
+        self._spin_bitrate.pack(side="left")
+        ttk.Label(r1b, text="kbps").pack(side="left", padx=2)
+        Tooltip(self._spin_bitrate, "Average video bitrate (single-pass VBR, no 2-pass): the file "
+                "size is predictable but quality varies with the content. "
+                "Audio is not included.")
+
         # Riga 2: look_ahead / FPS / risoluzione
         r2 = ttk.Frame(self._frm_video_specific); r2.pack(fill="x", padx=5, pady=3)
         self._var_lookahead = tk.BooleanVar(value=True)
@@ -2998,7 +3049,8 @@ class App(_BaseTk):
         for var in (self._var_quality, self._var_lookahead, self._var_limit_fps,
                     self._var_fps, self._var_audio, self._var_subs,
                     self._var_ts, self._var_res, self._var_vcodec,
-                    self._var_hflip, self._var_vflip, self._var_ar_ratio):
+                    self._var_hflip, self._var_vflip, self._var_ar_ratio,
+                    self._var_rate_mode, self._var_bitrate):
             var.trace_add("write", lambda *_: self._aggiorna_anteprima())
         # Il formato output influenza anche gli avvisi metadati
         self._var_ext.trace_add("write", lambda *_: (
@@ -3111,6 +3163,7 @@ class App(_BaseTk):
             "quality":    self._var_quality.get(),
             "look_ahead": self._var_lookahead.get(),
             "preset":     self._preset_id(),
+            "bitrate_kbps": self._bitrate_target(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
             "audio":      self._var_audio.get(),
@@ -3589,6 +3642,16 @@ class App(_BaseTk):
         self._var_vcodec.set(default_lbl)
         self._toggle_vcodec()
 
+    def _bitrate_target(self):
+        """Bitrate video target in kbps se "Target bitrate" è attivo, altrimenti None
+        (modalità qualità). Un valore non numerico o < 100 ricade su 100."""
+        if self._var_rate_mode.get() != "bitrate":
+            return None
+        try:
+            return max(100, int(float(self._var_bitrate.get())))
+        except ValueError:
+            return 100
+
     def _preset_id(self) -> str:
         """Preset QSV scelto ('veryfast'/'medium'/'veryslow'); usato solo da hevc_qsv."""
         label = self._var_preset.get()
@@ -3597,7 +3660,10 @@ class App(_BaseTk):
     def _toggle_vcodec(self):
         encode = self._vcodec_id() != "copy"
         state  = "normal" if encode else "disabled"
-        self._spin_quality.configure(state=state)
+        by_bitrate = self._var_rate_mode.get() == "bitrate"
+        self._spin_quality.configure(state="disabled" if by_bitrate else state)
+        self._btn_quality_auto.configure(state="disabled" if by_bitrate else "normal")
+        self._spin_bitrate.configure(state=state if by_bitrate else "disabled")
         # look-ahead non ha effetto su libx265/libsvtav1 (interno) né su VideoToolbox
         la_state = ("normal" if encode and self._vcodec_id()
                     not in ("libx265", "libsvtav1", "hevc_videotoolbox") else "disabled")
@@ -3962,6 +4028,7 @@ class App(_BaseTk):
             "quality":    self._var_quality.get(),
             "look_ahead": self._var_lookahead.get(),
             "preset":     self._preset_id(),
+            "bitrate_kbps": self._bitrate_target(),
             "hflip":      self._var_hflip.get(),
             "vflip":      self._var_vflip.get(),
             "ar_mode":    self._var_ar_mode.get(),

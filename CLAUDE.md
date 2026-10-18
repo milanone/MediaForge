@@ -45,7 +45,12 @@ subclass when `tkinterdnd2` is available). Three tabs (`ttk.Notebook`) sharing o
 Batch-converts a folder of video files to HEVC/AV1. Key pieces:
 - `encoder_video_args()` — per-encoder ffmpeg args (QSV/AMF/NVENC each need different rate-control
   flags; VideoToolbox uses an inverted 1-100 quality scale vs. the GUI's CRF-style 1-51; `hevc_qsv`
-  also gets `-preset` from the 3 real QSV levels veryfast/medium/veryslow, `QSV_PRESETS`)
+  also gets `-preset` from the 3 real QSV levels veryfast/medium/veryslow, `QSV_PRESETS`).
+  The "Rate control" row switches between quality (CRF) and a target average bitrate in kbps
+  (`opts["bitrate_kbps"]`, `_bitrate_target()`): `encoder_bitrate_args()` emits single-pass VBR
+  (`-b:v`, plus `-rc vbr_peak` for AMF and `-rc vbr` for NVENC; no 2-pass). Verified on real files
+  with `hevc_qsv` (1000/3000 kbps -> 1025/3070 measured) and `libx265`; AMF, NVENC, VideoToolbox,
+  SVT-AV1 and `av1_qsv` (not working on this machine even in CRF mode) are untested
 - `crf_suggerito()` — default CRF from the selected file's resolution (higher resolution → higher
   CRF, same perceived quality) and a -4 offset for the AV1 family (more efficient than HEVC/H.264
   at the same CRF number). QSV encoders (`QSV_ENCODERS`) use a separate measured curve instead:
