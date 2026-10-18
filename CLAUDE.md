@@ -85,6 +85,7 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   subtitles are not added to a partial file; stopping during 2-pass pass 1 keeps nothing; if ffmpeg
   doesn't close within 30 s it is terminated and the file discarded. Tested on mkv/mp4 with
   hevc_qsv and libx265 (incl. 2-pass pass 2): files decode with no errors
+- Startup with a file argument ("Apri con" from XYplorer): the file is preselected via `after()` in `_preseleziona_file_iniziale()`, after the window is shown. Reading it (ffprobe + exact bitrate) took ~15 s on a film on Google Drive and the window did not appear until then (measured the same on the older version)
 - Non-square pixels: `rileva_pixel_non_quadrati()` shows a warning (what SAR means, what to pick) with a
   "Fix: Deforma + Originale" button (`_correggi_sar()`) that sets Aspect ratio = stretch, ratio = Originale
   (and leaves "Copia stream" if "Solo correggi DAR" had selected it). Checked on a 700x480 SAR 8:9 file:

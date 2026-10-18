@@ -2657,14 +2657,30 @@ class App(_BaseTk):
         self._cerca_file()      # popola subito con la cartella corrente, senza dover premere nulla
         if self._file_iniziale is not None:
             # "Apri con" su un file specifico (non solo una cartella): lo
-            # preseleziona subito, come se l'utente lo avesse già cliccato.
+            # preseleziona come se l'utente lo avesse già cliccato. Dopo che la
+            # finestra è comparsa (after): la lettura del file (ffprobe e
+            # bitrate reale, ~15 s su un film su Google Drive) bloccava
+            # l'avvio e la finestra non si vedeva finché non finiva.
+            self._lbl_stato.config(text="Reading the file…")
+            self.after(100, self._preseleziona_file_iniziale)
+        self._poll_log()
+
+    def _preseleziona_file_iniziale(self):
+        """Seleziona nella lista il file passato da riga di comando (vedi
+        argomento_avvio) e ne mostra gli stream."""
+        try:
             for i, f in enumerate(self._all_files):
                 if f.name == self._file_iniziale.name:
                     self._listbox.selection_clear(0, "end")
                     self._listbox.selection_set(i)
+                    self._listbox.see(i)
+                    self.config(cursor="watch")
+                    self.update_idletasks()
                     self._on_selezione()
                     break
-        self._poll_log()
+        finally:
+            self.config(cursor="")
+            self._lbl_stato.config(text="")
 
     # -----------------------------------------------------------------------
     # Contenitore scrollabile (finestra ridimensionabile su monitor piccoli)
