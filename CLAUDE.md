@@ -79,7 +79,11 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   filter chain, encoder, CRF, GPU decode with the same fallback steps), video stream only, in a temp folder; then
   `summarize_bitrates()` gives mean/min/max and the video size the mean predicts (audio and subtitles not included).
   Start times: random (`predict_start_times()`: 5%..95% of the film cut in N bins, one random start per bin) or typed
-  (`parse_start_times()`: minutes or mm:ss). Runs in a thread, the button turns into Cancel, the result is in the label
+  (`parse_start_times()`: minutes or mm:ss). The "🎲 New points" button (`_predict_new_points()`) draws a fresh set
+  with the same rule and writes it, as h:mm:ss (`format_clock()`), in the Selected-times field, so the points are
+  visible and editable before predicting; the label shows the chosen points, then "Clip 2 of 3, at 0:20:00…" (the
+  thread sends `predict_status` lines through the log queue), and the final summary lists every point with its
+  bitrate. Runs in a thread, the button turns into Cancel, the result is in the label
   under the row and in the log; Start is refused while it runs. Verified on the Loki file through the engine and through
   the real window: the three clips above gave 1870/1757/1247 kbps at CRF 16 (the hand-made encodes gave 1871/1758/1248).
   Random clips differ from run to run: one run with random times gave a mean of 1266 (916-1468) against 1625 for the

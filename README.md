@@ -43,7 +43,7 @@ control the playback side, not a safe default otherwise.
   (e.g. to 1080p) gets CRF 16 instead, because at the higher CRFs the detailed scenes lose most of
   their fine detail (measured on one 4K HDR series, see `CLAUDE.md`)
 - "Predict bitrate": encodes a few short clips (default 3 of 1 minute, at random times or at times
-  you type) with the current settings and shows the bitrate of each, the mean, min and max, and the
+  you type; a dice button draws a new set of random points each time) with the current settings and shows the bitrate of each, the mean, min and max, and the
   video size the mean predicts for the whole file. It is an estimate: at the same CRF the bitrate
   differs a lot between scenes, so look at min and max, not only the mean
 - On Windows with a QSV encoder, decoding and the resolution-cap scaling both run on the GPU

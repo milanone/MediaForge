@@ -2019,6 +2019,12 @@ def parse_start_times(text: str, duration: float, clip_sec: float) -> list:
     return out
 
 
+def format_clock(secs: float) -> str:
+    """h:mm:ss for a time in seconds (also accepted back by parse_start_times)."""
+    s = int(secs)
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
 def summarize_bitrates(kbps: list, duration: float) -> dict:
     """Mean/min/max of the measured clip bitrates and the video size that the mean predicts for the whole file
     (MB = 2^20 bytes like the rest of the app; audio and subtitles are not included)."""
@@ -2089,6 +2095,8 @@ def predict_bitrate(src: Path, opts: dict, n: int, clip_sec: float, start_text: 
         return None
     log_q.put(("info", f"\n▶ Predict bitrate: {src.name}  ({len(starts)} clip(s) of {clip_sec / 60:g} min, "
                        f"CRF {opts.get('quality')})"))
+    log_q.put(("detail", "  Clip start times: " + ", ".join(format_clock(s) for s in starts)))
+    log_q.put(("predict_status", "Clips at " + ", ".join(format_clock(s) for s in starts)))
     tmpdir = Path(tempfile.mkdtemp(prefix="mediaforge_predict_"))
     samples = []
     try:
@@ -2096,14 +2104,14 @@ def predict_bitrate(src: Path, opts: dict, n: int, clip_sec: float, start_text: 
             if stop_ev.is_set():
                 log_q.put(("detail", "  Interrotto dall'utente."))
                 return None
+            log_q.put(("predict_status", f"Clip {i} of {len(starts)}, at {format_clock(start)}…"
+                       + (" so far: " + ", ".join(f"{k:.0f}" for _s, k in samples) + " kbps" if samples else "")))
             kbps = encode_sample(src, opts, data, start, clip_sec, tmpdir, log_q, stop_ev)
             if kbps is None:
                 log_q.put(("error", f"  ✗ Clip {i} failed."))
                 return None
             samples.append((start, kbps))
-            m, s = divmod(int(start), 60)
-            h, m = divmod(m, 60)
-            log_q.put(("detail", f"  clip {i}/{len(starts)} at {h}:{m:02d}:{s:02d}  →  {kbps:.0f} kbps"))
+            log_q.put(("detail", f"  clip {i}/{len(starts)} at {format_clock(start)}  →  {kbps:.0f} kbps"))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     res = summarize_bitrates([k for _s, k in samples], duration)
@@ -3137,9 +3145,14 @@ class App(_BaseTk):
                         command=self._toggle_predict).pack(side="left", padx=4)
         self._var_pred_times = tk.StringVar(value="")
         self._entry_pred_times = ttk.Entry(r1c, textvariable=self._var_pred_times, width=18, state="disabled")
-        self._entry_pred_times.pack(side="left", padx=(0, 12))
+        self._entry_pred_times.pack(side="left", padx=(0, 4))
         Tooltip(self._entry_pred_times, "Start of each clip, comma-separated: minutes (13, 20.5) or mm:ss / h:mm:ss.\n"
                 "The number of clips is the number of times you type.")
+        self._btn_pred_dice = ttk.Button(r1c, text="🎲 New points", command=self._predict_new_points)
+        self._btn_pred_dice.pack(side="left", padx=(0, 12))
+        Tooltip(self._btn_pred_dice, "Draws a new set of random start times (spread over the film, one per slice)\n"
+                "and writes them in 'Selected times', so you can see and edit them before predicting.\n"
+                "Press again for another set.")
         self._btn_predict = ttk.Button(r1c, text="Predict bitrate", command=self._predict_bitrate)
         self._btn_predict.pack(side="left")
         Tooltip(self._btn_predict, "Encodes a few short clips of the selected file with the CURRENT settings (encoder,\n"
@@ -3997,6 +4010,29 @@ class App(_BaseTk):
         self._entry_pred_times.configure(
             state="normal" if self._var_pred_mode.get() == "selected" else "disabled")
 
+    def _predict_new_points(self):
+        """"🎲 New points" button: draws a new set of random clip start times for the selected file (same
+        rule as the "Random times" mode, see predict_start_times) and writes them in the "Selected times"
+        field, so they are visible and editable before "Predict bitrate"."""
+        sel = self._listbox.curselection()
+        if len(sel) != 1:
+            messagebox.showinfo("Predict bitrate", "Select one file in the list first.")
+            return
+        data = self._ottieni_probe(self._all_files[sel[0]])
+        try:
+            duration = float(data.get("format", {}).get("duration") or 0)
+            n = int(self._var_pred_n.get())
+            clip_sec = float(self._var_pred_min.get().replace(",", ".")) * 60
+            if duration <= 0 or not 1 <= n <= 10 or clip_sec <= 0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Predict bitrate", "Clips: 1-10, length: a number of minutes above 0.")
+            return
+        starts = predict_start_times(duration, n, min(clip_sec, duration))
+        self._var_pred_times.set(", ".join(format_clock(s) for s in starts))
+        self._var_pred_mode.set("selected")
+        self._toggle_predict()
+
     def _predict_bitrate(self):
         """"Predict bitrate" button: encodes a few short clips of the selected file with the current settings
         (predict_bitrate) in a thread and shows the result in the label under the row and in the log. While it
@@ -4070,8 +4106,9 @@ class App(_BaseTk):
             return
         size = res["size_mb"]
         size_txt = f"{size / 1024:.1f} GB" if size >= 1024 else f"{size:.0f} MB"
+        points = " · ".join(f"{format_clock(s)} → {k:.0f}" for s, k in res["samples"])
         txt = (f"CRF {quality}: mean {res['mean']:.0f} kbps (min {res['min']:.0f} – max {res['max']:.0f}) over "
-               f"{len(res['samples'])} clip(s) → about {size_txt} of video for the whole file "
+               f"{len(res['samples'])} clip(s) [{points}] → about {size_txt} of video for the whole file "
                "(audio and subtitles not included; an estimate)")
         self._lbl_predict.configure(text=txt)
         self._log_write("ok", "  ✓ " + txt)
@@ -5537,6 +5574,9 @@ class App(_BaseTk):
                 tag, msg = self._log_q.get_nowait()
                 if tag == "encoders":
                     self._applica_rilevamento(msg)
+                elif tag == "predict_status":
+                    if self._predict_running:   # a late line must not overwrite the final result
+                        self._lbl_predict.configure(text=msg)   # "Predict bitrate" progress, see predict_bitrate
                 elif tag == "done":
                     if self._active_op == "mux":
                         self._btn_mux_start.configure(state="normal")

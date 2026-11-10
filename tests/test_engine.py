@@ -200,6 +200,18 @@ class PredictBitrate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mf.parse_start_times(bad, 6000, 60)
 
+    def test_clock_format_round_trips_through_the_parser(self):
+        self.assertEqual(mf.format_clock(824.7), "0:13:44")
+        self.assertEqual(mf.format_clock(3723), "1:02:03")
+        self.assertEqual(mf.parse_start_times(mf.format_clock(824.7), 6000, 60), [824.0])
+
+    def test_new_points_text_can_be_fed_back_as_selected_times(self):
+        import random
+        starts = mf.predict_start_times(6000, 4, 60, random.Random(1))
+        text = ", ".join(mf.format_clock(s) for s in starts)
+        parsed = mf.parse_start_times(text, 6000, 60)
+        self.assertEqual(parsed, [float(int(s)) for s in starts])
+
     def test_summary_mean_min_max_and_size(self):
         s = mf.summarize_bitrates([483, 732, 505], 3000)
         self.assertAlmostEqual(s["mean"], 573.33, places=1)
