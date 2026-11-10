@@ -63,6 +63,28 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   Applied on file selection and on encoder change via
   `_aggiorna_quality_da_risoluzione()`, until the user edits the value by hand
   (`_quality_manuale`) — the "↺ Auto" button re-enables it
+- Default CRF for a 4K source scaled down (QSV): `crf_suggerito(..., source_side)` returns 16 when the source long side
+  is >= `QSV_SOURCE_4K_MIN` (3000) and the output is smaller (`QSV_CRF_DOWNSCALED_4K`); a 4K kept at 4K still gets 22
+  (the old curve, not re-measured). Why: Loki S01E01 (4K HDR, 23 Mbps), `hevc_qsv` to 1080p, three 60 s clips at
+  13:44, 20:00 and 32:51. Mean video bitrate over the clips: CRF 14 2594 kbps, 16 1625, 18 1081, 20 776, 22 573 (the
+  user's own 4K -> 1080p encodes at CRF 22 came out at 600-700 kbps). Detail kept, measured as high-frequency
+  (Laplacian) energy of the luma against the source scaled to 1080p, relative to CRF 8 (12.4 Mbps, which keeps all
+  of it: the scaler is not the cause): in the two detailed frames 39%/33% at CRF 14, 23%/18% at 16, 17%/14% at 18,
+  14%/10% at 22; in a plain frame 88/84/80/74%. The bitrate of the most detailed clip fell 86% from CRF 14 to 22
+  against 71-72% for the others: high CRFs flatten the detailed scenes most. The metric cannot tell grain from real
+  detail, and it is 3 frames of one clip of one series: an indication, not a proof. The user's choice: 16 to save
+  space, 14 to keep detail; 16 is the default
+- "Predict bitrate" (`predict_bitrate()`, `encode_sample()`, row under Rate control): encodes N clips (1-10, default
+  3) of X minutes (default 1) of the selected file with the CURRENT settings, through `build_ffmpeg_cmd()` (same
+  filter chain, encoder, CRF, GPU decode with the same fallback steps), video stream only, in a temp folder; then
+  `summarize_bitrates()` gives mean/min/max and the video size the mean predicts (audio and subtitles not included).
+  Start times: random (`predict_start_times()`: 5%..95% of the film cut in N bins, one random start per bin) or typed
+  (`parse_start_times()`: minutes or mm:ss). Runs in a thread, the button turns into Cancel, the result is in the label
+  under the row and in the log; Start is refused while it runs. Verified on the Loki file through the engine and through
+  the real window: the three clips above gave 1870/1757/1247 kbps at CRF 16 (the hand-made encodes gave 1871/1758/1248).
+  Random clips differ from run to run: one run with random times gave a mean of 1266 (916-1468) against 1625 for the
+  three fixed points, so with 3 clips of 1 minute the estimate can be off by 25% or more — use more clips for a firmer
+  number
 - `costruisci_filtri_video()` — builds the ffmpeg filter chain (scale/aspect-ratio/FPS/flip)
 - `bitrate_video_esatto()` — exact real video bitrate via summing packet sizes from ffprobe
   (`packet=size`), not an estimate from container-level bitrate minus audio (that approach was
@@ -180,6 +202,8 @@ enforces the "same" rows.
 | Real bitrate, declared bitrate, fix of a stale bitrate tag | yes | yes | same method; the web computes the real bitrate on every probe, the desktop only when nothing is declared or on request |
 | GPU decoder drops frames (error lines in the ffmpeg log) | stops the attempt, software fallback by itself | warning in the page: continue / stop / redo in software | different on purpose (software is very slow on gaia) |
 | GPU path | direct QSV first (`-hwaccel qsv`, as the web), then `d3d11va` + `hwmap`, then software | `-hwaccel qsv`, then software | same first choice; the extra d3d11va step exists only on Windows |
+| Default CRF for a 4K source scaled down (QSV) | 16 (`QSV_CRF_DOWNSCALED_4K`, via `crf_suggerito(source_side=)`) | 16 (`QSV_CRF_DOWNSCALED_4K` in `index.html`; the page now also feeds the OUTPUT size after the resolution cap, as the desktop does) | same (tested through node) |
+| Predict bitrate (N clips of X min, random or typed times, mean/min/max, predicted size) | `predict_bitrate()` | `/api/predict`, `run_predict()` | same method (start-time and summary functions tested against each other); the web runs it as a hidden job and has no software fallback beyond software decoding |
 | Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
 | Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |
 

@@ -39,7 +39,13 @@ control the playback side, not a safe default otherwise.
   verified with QSV HEVC and libx265; the AMF/NVENC/VideoToolbox/AV1 variants are untested),
   with an optional 2-pass mode for the software encoders (libx265, SVT-AV1)
 - QSV (HEVC) offers 3 real preset levels (fast / normal / slow), and its default CRF follows
-  measured values per resolution (480p=16, 720p=18, 1080p=20, 4K=22)
+  measured values per resolution (480p=16, 720p=18, 1080p=20, 4K=22); a 4K source scaled down
+  (e.g. to 1080p) gets CRF 16 instead, because at the higher CRFs the detailed scenes lose most of
+  their fine detail (measured on one 4K HDR series, see `CLAUDE.md`)
+- "Predict bitrate": encodes a few short clips (default 3 of 1 minute, at random times or at times
+  you type) with the current settings and shows the bitrate of each, the mean, min and max, and the
+  video size the mean predicts for the whole file. It is an estimate: at the same CRF the bitrate
+  differs a lot between scenes, so look at min and max, not only the mean
 - On Windows with a QSV encoder, decoding and the resolution-cap scaling both run on the GPU
   (`d3d11va` decode, frames kept on the GPU through `scale_qsv` to the encoder), with HDR/10-bit
   files keeping their color depth and HDR metadata; other filters (crop/pad/fps/flip) are

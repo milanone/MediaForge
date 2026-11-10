@@ -19,6 +19,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -362,6 +363,13 @@ QSV_ENCODERS = ("hevc_qsv", "av1_qsv")
 # resta fisso, in mezzo si interpola in scala logaritmica del lato.
 QSV_CRF_POINTS = ((854, 16), (1280, 18), (1920, 20), (3840, 22))
 QSV_CRF_DEFAULT = 20
+# A 4K-class source (long side >= QSV_SOURCE_4K_MIN) scaled down to a lower resolution gets this CRF instead of
+# the curve above (20 at 1080p). Measured 2026-11-10 on Loki S01E01, 3 clips of 60 s, 4K HDR -> 1080p, hevc_qsv:
+# detail kept (high-frequency energy vs the 1080p-scaled source, relative to CRF 8) fell to about a third at CRF
+# 14 and to a fifth at CRF 16 in the detailed scenes, and bitrate at CRF 22 was ~570 kbps. The author's choice is
+# 16 (saves space) or 14 (keeps detail); 16 is the default. Not measured: 4K source kept at 4K.
+QSV_SOURCE_4K_MIN = 3000
+QSV_CRF_DOWNSCALED_4K = 16
 # Preset QSV: i livelli reali sono 3 (misurato su N150 con hevc_qsv: da fast a
 # slow il file e' identico, faster=veryfast, slower=veryslow).
 QSV_PRESETS = (
@@ -383,7 +391,7 @@ def _interpola_log(x, points) -> float:
             return y0 + (y1 - y0) * math.log(x / x0) / math.log(x1 / x0)
 
 
-def crf_suggerito(width, height, encoder=None) -> int:
+def crf_suggerito(width, height, encoder=None, source_side=None) -> int:
     """CRF di default in base alla risoluzione (scala 1=max qualità … 51=min,
     vedi encoder_video_args): più pixel ha il fotogramma, meglio "nascondono"
     gli artefatti di compressione, quindi conviene un CRF più alto (più
@@ -415,6 +423,10 @@ def crf_suggerito(width, height, encoder=None) -> int:
         # +3 per raddoppio" qui sotto comprimeva troppo (28 a 4K). Misurato
         # solo su hevc_qsv: av1_qsv usa la stessa curva con il +1 AV1.
         base = QSV_CRF_DEFAULT if lato_lungo <= 0 else _interpola_log(lato_lungo, QSV_CRF_POINTS)
+        # source_side = long side of the SOURCE: a 4K source scaled down keeps more fine detail
+        # to protect than the output size alone suggests (see QSV_CRF_DOWNSCALED_4K)
+        if source_side and source_side >= QSV_SOURCE_4K_MIN and 0 < lato_lungo < source_side:
+            base = QSV_CRF_DOWNSCALED_4K
         if famiglia == "av1":
             base += 1
         return max(1, min(51, round(base)))
@@ -1963,6 +1975,142 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
             return False
 
 
+PREDICT_EDGE = 0.05  # random clips stay inside 5%..95% of the film (no opening titles / end credits)
+
+
+def predict_start_times(duration: float, n: int, clip_sec: float, rng=None) -> list:
+    """Start times (s) of n clips for "Predict bitrate", random but spread out: the usable range (5%..95% of
+    the film, clip length included) is cut in n equal bins and one start is drawn inside each bin, so three
+    clips never end up in the same scene while the choice still changes at every press."""
+    rng = rng or random
+    lo = duration * PREDICT_EDGE
+    hi = duration * (1 - PREDICT_EDGE) - clip_sec
+    if n < 1 or duration <= clip_sec:
+        return [0.0]
+    if hi <= lo:
+        return [max(0.0, (duration - clip_sec) / 2)]
+    width = (hi - lo) / n
+    return [lo + width * i + rng.uniform(0, width) for i in range(n)]
+
+
+def parse_start_times(text: str, duration: float, clip_sec: float) -> list:
+    """Start times typed by the user for "Predict bitrate": comma-separated, each one in minutes (13, 20.5) or as
+    mm:ss / h:mm:ss. Returns seconds; raises ValueError with a message for the user if one is invalid or the clip
+    would run past the end of the file."""
+    out = []
+    for token in (t.strip() for t in text.replace(";", ",").split(",")):
+        if not token:
+            continue
+        try:
+            if ":" in token:
+                secs = 0.0
+                for part in token.split(":"):
+                    secs = secs * 60 + float(part)
+            else:
+                secs = float(token) * 60
+        except ValueError:
+            raise ValueError(f"'{token}' is not a time: use minutes (13 or 20.5) or mm:ss")
+        if secs < 0 or secs + clip_sec > duration + 0.5:
+            raise ValueError(f"'{token}': the {clip_sec / 60:g} min clip does not fit in a "
+                             f"{duration / 60:.1f} min file")
+        out.append(secs)
+    if not out:
+        raise ValueError("Type at least one start time (minutes, comma-separated)")
+    return out
+
+
+def summarize_bitrates(kbps: list, duration: float) -> dict:
+    """Mean/min/max of the measured clip bitrates and the video size that the mean predicts for the whole file
+    (MB = 2^20 bytes like the rest of the app; audio and subtitles are not included)."""
+    mean = sum(kbps) / len(kbps)
+    return {"mean": mean, "min": min(kbps), "max": max(kbps),
+            "size_mb": mean * 1000 * duration / 8 / 1_048_576}
+
+
+def encode_sample(src: Path, opts: dict, data: dict, start: float, clip_sec: float,
+                  tmpdir: Path, log_q: queue.Queue, stop_ev: threading.Event):
+    """Encodes one clip of the video stream with exactly the settings of a real encode (same filter chain,
+    encoder, CRF, GPU decoding with the same fallback steps as converti_file) and returns its real video bitrate
+    in kbps, or None if the attempt failed or was stopped."""
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        return None
+    dst = tmpdir / f"clip_{int(start)}.mkv"
+    sample_opts = dict(opts, ss=f"{start:.2f}", t=f"{clip_sec:.2f}", stream_map=[video.get("index", streams.index(video))],
+                       audio="copy", subs="no", output_ext="mkv", bitrate_kbps=None, two_pass=False, finish_ev=None)
+    sample_opts.pop("pass_num", None)
+    hw_chain = (list(HW_DECODE_MODES)
+                if usa_hwaccel_decode(opts.get("vcodec"), video) and opts.get("gpu_decode", True) else [])
+    hwaccel = hw_chain.pop(0) if hw_chain else None
+    while True:
+        cmd = build_ffmpeg_cmd(src, dst, sample_opts, data, None, hwaccel_decode=hwaccel or False)
+        log_q.put(("cmd", "  $ " + " ".join(cmd)))
+        esito, _rc = esegui_ffmpeg_con_watchdog(cmd, log_q, stop_ev,
+                                                fatal_patterns=GPU_DECODE_ERRORS if "-hwaccel" in cmd else ())
+        if esito == "ok":
+            break
+        dst.unlink(missing_ok=True)
+        if esito == "errore" and hwaccel:  # GPU decoding failed: next method, finally software (as converti_file)
+            hwaccel = hw_chain.pop(0) if hw_chain else None
+            continue
+        return None
+    try:
+        real = float(ffprobe_json(dst).get("format", {}).get("duration") or 0)
+    except ValueError:
+        real = 0.0
+    bit_s = bitrate_video_esatto(dst, real)
+    dst.unlink(missing_ok=True)
+    return bit_s / 1000 if bit_s else None
+
+
+def predict_bitrate(src: Path, opts: dict, n: int, clip_sec: float, start_text: str,
+                    log_q: queue.Queue, stop_ev: threading.Event):
+    """"Predict bitrate": encodes n short clips of the file with the CURRENT settings (CRF, encoder, resolution
+    cap...) and reports the bitrate of each, the mean/min/max and the video size the mean predicts. Clips start
+    at random times (start_text empty) or at the times the user typed (see parse_start_times). Returns a dict
+    (samples = [(start s, kbps)], plus summarize_bitrates keys and duration) or None on failure/stop.
+    The mean of a few clips is only an estimate: bitrate changes a lot from scene to scene at the same CRF
+    (measured on a film at CRF 22: 483..732 kbps over three clips), so the min/max matter as much as the mean."""
+    data = ffprobe_json(src)
+    try:
+        duration = float(data.get("format", {}).get("duration") or 0)
+    except ValueError:
+        duration = 0.0
+    if duration <= 0:
+        log_q.put(("error", "  ✗ Cannot read the duration of this file."))
+        return None
+    clip_sec = min(clip_sec, duration)
+    try:
+        starts = (parse_start_times(start_text, duration, clip_sec) if start_text.strip()
+                  else predict_start_times(duration, n, clip_sec))
+    except ValueError as e:
+        log_q.put(("error", f"  ✗ {e}"))
+        return None
+    log_q.put(("info", f"\n▶ Predict bitrate: {src.name}  ({len(starts)} clip(s) of {clip_sec / 60:g} min, "
+                       f"CRF {opts.get('quality')})"))
+    tmpdir = Path(tempfile.mkdtemp(prefix="mediaforge_predict_"))
+    samples = []
+    try:
+        for i, start in enumerate(starts, 1):
+            if stop_ev.is_set():
+                log_q.put(("detail", "  Interrotto dall'utente."))
+                return None
+            kbps = encode_sample(src, opts, data, start, clip_sec, tmpdir, log_q, stop_ev)
+            if kbps is None:
+                log_q.put(("error", f"  ✗ Clip {i} failed."))
+                return None
+            samples.append((start, kbps))
+            m, s = divmod(int(start), 60)
+            h, m = divmod(m, 60)
+            log_q.put(("detail", f"  clip {i}/{len(starts)} at {h}:{m:02d}:{s:02d}  →  {kbps:.0f} kbps"))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    res = summarize_bitrates([k for _s, k in samples], duration)
+    res.update(samples=samples, duration=duration)
+    return res
+
+
 def worker(files: list, opts: dict, log_q: queue.Queue, stop_ev: threading.Event):
     ok = err = 0
     for f in files:
@@ -2670,6 +2818,8 @@ class App(_BaseTk):
         self._bitrate_video_cache: dict = {}  # str(path) -> bit/s, vedi _ottieni_bitrate_video
         self._var_ss_on = None
         self._var_t_on  = None
+        self._predict_running = False   # "Predict bitrate" test encodes in progress (see _predict_bitrate)
+        self._predict_stop = None
         self._active_op = None  # None | "codifica" | "mux" | "capitoli": evita avvii concorrenti tra i tab
 
         # --- Stato tab Mux ---
@@ -2969,6 +3119,36 @@ class App(_BaseTk):
         Tooltip(self._spin_bitrate, "Average video bitrate (single-pass VBR, no 2-pass): the file "
                 "size is predictable but quality varies with the content. "
                 "Audio is not included.")
+
+        # Riga 1c: Predict bitrate (short test encodes with the current settings, to see how the CRF will turn out)
+        r1c = ttk.Frame(self._frm_video_specific); r1c.pack(fill="x", padx=5, pady=3)
+        ttk.Label(r1c, text="Predict bitrate:").pack(side="left")
+        self._var_pred_n = tk.IntVar(value=3)
+        ttk.Spinbox(r1c, from_=1, to=10, textvariable=self._var_pred_n, width=3).pack(side="left", padx=(6, 2))
+        ttk.Label(r1c, text="clips of").pack(side="left", padx=2)
+        self._var_pred_min = tk.StringVar(value="1")
+        ttk.Spinbox(r1c, from_=0.5, to=10, increment=0.5, textvariable=self._var_pred_min,
+                    width=4).pack(side="left")
+        ttk.Label(r1c, text="min").pack(side="left", padx=(2, 12))
+        self._var_pred_mode = tk.StringVar(value="random")
+        ttk.Radiobutton(r1c, text="Random times", variable=self._var_pred_mode, value="random",
+                        command=self._toggle_predict).pack(side="left", padx=4)
+        ttk.Radiobutton(r1c, text="Selected times (min):", variable=self._var_pred_mode, value="selected",
+                        command=self._toggle_predict).pack(side="left", padx=4)
+        self._var_pred_times = tk.StringVar(value="")
+        self._entry_pred_times = ttk.Entry(r1c, textvariable=self._var_pred_times, width=18, state="disabled")
+        self._entry_pred_times.pack(side="left", padx=(0, 12))
+        Tooltip(self._entry_pred_times, "Start of each clip, comma-separated: minutes (13, 20.5) or mm:ss / h:mm:ss.\n"
+                "The number of clips is the number of times you type.")
+        self._btn_predict = ttk.Button(r1c, text="Predict bitrate", command=self._predict_bitrate)
+        self._btn_predict.pack(side="left")
+        Tooltip(self._btn_predict, "Encodes a few short clips of the selected file with the CURRENT settings (encoder,\n"
+                "CRF, resolution cap, filters) and shows the bitrate of each, the mean and the video size it predicts.\n"
+                "Only an estimate: at the same CRF the bitrate changes a lot between scenes, so look at min/max too.\n"
+                "Press again while it runs to cancel. Quality (CRF) mode only.")
+        self._lbl_predict = ttk.Label(self._frm_video_specific, text="", foreground="gray",
+                                      wraplength=900, justify="left")
+        self._lbl_predict.pack(fill="x", padx=12, pady=(0, 2))
 
         # Riga 2: look_ahead / FPS / risoluzione
         r2 = ttk.Frame(self._frm_video_specific); r2.pack(fill="x", padx=5, pady=3)
@@ -3629,11 +3809,12 @@ class App(_BaseTk):
         w, h = video.get("width"), video.get("height")
         if not w or not h:
             return
+        source_side = max(int(w), int(h))
         limite = int(self._var_res.get())
         w, h = risoluzione_effettiva(w, h, limite if limite > 0 else None)
         self._aggiornando_quality_auto = True
         try:
-            self._var_quality.set(crf_suggerito(w, h, self._vcodec_id()))
+            self._var_quality.set(crf_suggerito(w, h, self._vcodec_id(), source_side))
         finally:
             self._aggiornando_quality_auto = False
 
@@ -3811,6 +3992,95 @@ class App(_BaseTk):
             self._var_limit_fps.set(False)
             self._toggle_fps()
         self._aggiorna_anteprima()
+
+    def _toggle_predict(self):
+        self._entry_pred_times.configure(
+            state="normal" if self._var_pred_mode.get() == "selected" else "disabled")
+
+    def _predict_bitrate(self):
+        """"Predict bitrate" button: encodes a few short clips of the selected file with the current settings
+        (predict_bitrate) in a thread and shows the result in the label under the row and in the log. While it
+        runs the button reads "Cancel"."""
+        if self._predict_running:
+            self._predict_stop.set()
+            self._btn_predict.configure(state="disabled")
+            return
+        sel = self._listbox.curselection()
+        if len(sel) != 1:
+            messagebox.showinfo("Predict bitrate", "Select one file in the list first.")
+            return
+        if self._active_op:
+            messagebox.showinfo("Predict bitrate", "Wait for the running operation to finish.")
+            return
+        if self._vcodec_id() == "copy" or self._var_rate_mode.get() == "bitrate":
+            messagebox.showinfo("Predict bitrate", "It works with an encoder in Quality (CRF) mode.")
+            return
+        try:
+            n = int(self._var_pred_n.get())
+            clip_sec = float(self._var_pred_min.get().replace(",", ".")) * 60
+            if not 1 <= n <= 10 or clip_sec <= 0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Predict bitrate", "Clips: 1-10, length: a number of minutes above 0.")
+            return
+        path = self._all_files[sel[0]]
+        res_val = int(self._var_res.get())
+        opts = {
+            "mode": "video", "output_ext": "mkv", "vcodec": self._vcodec_id(),
+            "quality": self._var_quality.get(), "look_ahead": self._var_lookahead.get(),
+            "preset": self._preset_id(), "bitrate_kbps": None, "two_pass": False,
+            "gpu_decode": self._var_gpu_decode.get(), "limit_fps": self._var_limit_fps.get(),
+            "fps_value": self._var_fps.get(), "fps_exact": self._fps_exact if self._var_limit_fps.get() else None,
+            "audio": "copy", "subs": "no", "timestamp": self._var_ts.get(), "stream_map": None,
+            "limite_res": res_val if res_val > 0 else None, "hflip": self._var_hflip.get(),
+            "vflip": self._var_vflip.get(), "ar_mode": self._var_ar_mode.get(),
+            "ar_ratio": self._var_ar_ratio.get(), "ss": None, "t": None,
+        }
+        start_text = self._var_pred_times.get() if self._var_pred_mode.get() == "selected" else ""
+        self._predict_stop = threading.Event()
+        self._predict_running = True
+        self._btn_predict.configure(text="Cancel")
+        self._lbl_predict.configure(text="Running… (each clip is encoded with the current settings)")
+        res_q = queue.Queue()
+
+        def run():
+            try:
+                res_q.put(predict_bitrate(path, opts, n, clip_sec, start_text, self._log_q, self._predict_stop))
+            except Exception as e:
+                self._log_q.put(("error", f"  ✗ {e}"))
+                res_q.put(None)
+
+        def wait():
+            try:
+                res = res_q.get_nowait()
+            except queue.Empty:
+                self.after(200, wait)
+                return
+            self._predict_done(res, opts["quality"])
+
+        threading.Thread(target=run, daemon=True).start()
+        self.after(200, wait)
+
+    def _predict_done(self, res, quality):
+        self._predict_running = False
+        self._btn_predict.configure(text="Predict bitrate")
+        self._toggle_vcodec_buttons_only()
+        if res is None:
+            self._lbl_predict.configure(text="Prediction failed or cancelled (see the log).")
+            return
+        size = res["size_mb"]
+        size_txt = f"{size / 1024:.1f} GB" if size >= 1024 else f"{size:.0f} MB"
+        txt = (f"CRF {quality}: mean {res['mean']:.0f} kbps (min {res['min']:.0f} – max {res['max']:.0f}) over "
+               f"{len(res['samples'])} clip(s) → about {size_txt} of video for the whole file "
+               "(audio and subtitles not included; an estimate)")
+        self._lbl_predict.configure(text=txt)
+        self._log_write("ok", "  ✓ " + txt)
+
+    def _toggle_vcodec_buttons_only(self):
+        """Re-enables the Predict button according to the current rate mode / encoder (after a prediction)."""
+        encode = self._vcodec_id() != "copy"
+        by_bitrate = self._var_rate_mode.get() == "bitrate"
+        self._btn_predict.configure(state="disabled" if by_bitrate or not encode else "normal")
 
     def _toggle_fps_keep_exact(self):
         """Come _toggle_fps ma senza azzerare la frazione esatta (limite attivo)."""
@@ -4085,6 +4355,8 @@ class App(_BaseTk):
         self._spin_bitrate.configure(state=state if by_bitrate else "disabled")
         self._chk_gpu_decode.configure(
             state="normal" if usa_hwaccel_decode(self._vcodec_id()) else "disabled")
+        if not self._predict_running:
+            self._btn_predict.configure(state="disabled" if by_bitrate or not encode else "normal")
         self._chk_two_pass.configure(
             state="normal" if by_bitrate and self._vcodec_id() in ("libx265", "libsvtav1")
             else "disabled")
@@ -4344,6 +4616,9 @@ class App(_BaseTk):
     def _avvia(self):
         if self._active_op:
             messagebox.showwarning("Attenzione", "È già in corso un'altra operazione.")
+            return
+        if self._predict_running:
+            messagebox.showinfo("Predict bitrate", "Predict bitrate is running: wait for it, or press Cancel.")
             return
         d = self._var_dir.get().strip()
         if not d or not Path(d).is_dir():

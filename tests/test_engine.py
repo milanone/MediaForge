@@ -160,5 +160,52 @@ class GpuDecodeSafety(unittest.TestCase):
         self.assertEqual(esito, "ok")
 
 
+class DefaultCrfForDownscaled4K(unittest.TestCase):
+    def test_4k_source_scaled_down_gets_16_with_qsv(self):
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "hevc_qsv", source_side=3840), 16)
+        self.assertEqual(mf.crf_suggerito(1280, 720, "hevc_qsv", source_side=3840), 16)
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "av1_qsv", source_side=3840), 17)
+
+    def test_4k_source_kept_at_4k_and_other_sources_keep_the_curve(self):
+        self.assertEqual(mf.crf_suggerito(3840, 2160, "hevc_qsv", source_side=3840), 22)
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "hevc_qsv", source_side=1920), 20)
+        self.assertEqual(mf.crf_suggerito(1280, 720, "hevc_qsv", source_side=2560), 18)
+
+    def test_other_encoders_are_not_affected(self):
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "libx265", source_side=3840), 25)
+
+
+class PredictBitrate(unittest.TestCase):
+    def test_random_starts_are_spread_one_per_bin_and_inside_the_film(self):
+        import random
+        d, clip = 6000.0, 60.0
+        for seed in range(50):
+            starts = mf.predict_start_times(d, 3, clip, random.Random(seed))
+            self.assertEqual(len(starts), 3)
+            self.assertGreaterEqual(starts[0], d * 0.05)
+            self.assertLessEqual(starts[-1] + clip, d * 0.95 + 1e-6)
+            self.assertEqual(starts, sorted(starts))
+            self.assertGreater(starts[1] - starts[0], 0)
+
+    def test_short_file_gives_one_clip(self):
+        self.assertEqual(mf.predict_start_times(30, 3, 60), [0.0])
+        self.assertEqual(len(mf.predict_start_times(100, 3, 90)), 1)
+
+    def test_typed_times_in_minutes_and_clock_format(self):
+        self.assertEqual(mf.parse_start_times("13, 20.5", 6000, 60), [780.0, 1230.0])
+        self.assertEqual(mf.parse_start_times("1:02:03; 5:30", 6000, 60), [3723.0, 330.0])
+
+    def test_typed_times_reject_bad_input(self):
+        for bad in ("abc", "", "100", "-1"):
+            with self.assertRaises(ValueError):
+                mf.parse_start_times(bad, 6000, 60)
+
+    def test_summary_mean_min_max_and_size(self):
+        s = mf.summarize_bitrates([483, 732, 505], 3000)
+        self.assertAlmostEqual(s["mean"], 573.33, places=1)
+        self.assertEqual((s["min"], s["max"]), (483, 732))
+        self.assertAlmostEqual(s["size_mb"], 573.33 * 1000 * 3000 / 8 / 1_048_576, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()
