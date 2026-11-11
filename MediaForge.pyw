@@ -1980,7 +1980,8 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
             return False
 
 
-PREDICT_EDGE = 0.05  # random clips stay inside 5%..95% of the film (no opening titles / end credits)
+PREDICT_MAX_CLIPS = 20   # clips per prediction (each is a real encode); the clip length can go down to 0.1 min
+PREDICT_EDGE = 0.05 # random clips stay inside 5%..95% of the film (no opening titles / end credits)
 
 
 def predict_start_times(duration: float, n: int, clip_sec: float, rng=None) -> list:
@@ -3371,10 +3372,10 @@ class App(_BaseTk):
         r1c = ttk.Frame(self._frm_video_specific); r1c.pack(fill="x", padx=5, pady=3)
         ttk.Label(r1c, text="Predict bitrate:").pack(side="left")
         self._var_pred_n = tk.IntVar(value=3)
-        ttk.Spinbox(r1c, from_=1, to=10, textvariable=self._var_pred_n, width=3).pack(side="left", padx=(6, 2))
+        ttk.Spinbox(r1c, from_=1, to=PREDICT_MAX_CLIPS, textvariable=self._var_pred_n, width=3).pack(side="left", padx=(6, 2))
         ttk.Label(r1c, text="clips of").pack(side="left", padx=2)
         self._var_pred_min = tk.StringVar(value="1")
-        ttk.Spinbox(r1c, from_=0.5, to=10, increment=0.5, textvariable=self._var_pred_min,
+        ttk.Spinbox(r1c, from_=0.1, to=10, increment=0.1, textvariable=self._var_pred_min,
                     width=4).pack(side="left")
         ttk.Label(r1c, text="min").pack(side="left", padx=(2, 12))
         self._var_pred_mode = tk.StringVar(value="random")
@@ -4269,10 +4270,10 @@ class App(_BaseTk):
             duration = float(data.get("format", {}).get("duration") or 0)
             n = int(self._var_pred_n.get())
             clip_sec = float(self._var_pred_min.get().replace(",", ".")) * 60
-            if duration <= 0 or not 1 <= n <= 10 or clip_sec <= 0:
+            if duration <= 0 or not 1 <= n <= PREDICT_MAX_CLIPS or clip_sec <= 0:
                 raise ValueError
         except (ValueError, tk.TclError):
-            messagebox.showwarning("Predict bitrate", "Clips: 1-10, length: a number of minutes above 0.")
+            messagebox.showwarning("Predict bitrate", f"Clips: 1-{PREDICT_MAX_CLIPS}, length: a number of minutes above 0.")
             return
         starts = predict_start_times(duration, n, min(clip_sec, duration))
         self._var_pred_times.set(", ".join(format_clock(s) for s in starts))
@@ -4300,10 +4301,10 @@ class App(_BaseTk):
         try:
             n = int(self._var_pred_n.get())
             clip_sec = float(self._var_pred_min.get().replace(",", ".")) * 60
-            if not 1 <= n <= 10 or clip_sec <= 0:
+            if not 1 <= n <= PREDICT_MAX_CLIPS or clip_sec <= 0:
                 raise ValueError
         except (ValueError, tk.TclError):
-            messagebox.showwarning("Predict bitrate", "Clips: 1-10, length: a number of minutes above 0.")
+            messagebox.showwarning("Predict bitrate", f"Clips: 1-{PREDICT_MAX_CLIPS}, length: a number of minutes above 0.")
             return
         path = self._all_files[sel[0]]
         res_val = int(self._var_res.get())
