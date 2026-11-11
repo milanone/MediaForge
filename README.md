@@ -46,6 +46,9 @@ control the playback side, not a safe default otherwise.
   you type; a dice button draws a new set of random points each time) with the current settings and shows the bitrate of each, the mean, min and max, and the
   video size the mean predicts for the whole file. It is an estimate: at the same CRF the bitrate
   differs a lot between scenes, so look at min and max, not only the mean
+- Bitrate over time: after a single-file conversion a window shows the exact video bitrate per minute (30 s to 5 min steps,
+  optional comparison with the source, "Save CSV…"; also from the "📈 Bitrate chart" button for any file). The "Bitrate CSV"
+  checkbox (on by default) also saves the same values as `<name>_bitrate.csv` next to every converted file
 - On Windows with a QSV encoder, decoding and the resolution-cap scaling both run on the GPU
   (`d3d11va` decode, frames kept on the GPU through `scale_qsv` to the encoder), with HDR/10-bit
   files keeping their color depth and HDR metadata; other filters (crop/pad/fps/flip) are

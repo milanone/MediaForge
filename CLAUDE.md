@@ -89,6 +89,17 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   Random clips differ from run to run: one run with random times gave a mean of 1266 (916-1468) against 1625 for the
   three fixed points, so with 3 clips of 1 minute the estimate can be off by 25% or more — use more clips for a firmer
   number
+- Bitrate over time (`BitrateChartWindow`, `read_video_packets()`, `bucket_bitrates()`): video bitrate per 30 s / 1 / 2 / 5 min
+  of film time, from the packet sizes (exact: the 30 s buckets of a 60 s clip averaged 1756.5 kbps against 1757 for the whole
+  file). Opens by itself at the end of a single-file encode (`("chart", ...)` message from `converti_file()`, only when
+  `self._run_files == 1`, so a batch does not open one window per file), and from the "📈 Bitrate chart" button for any file;
+  optional comparison with the source and "Save CSV…". The packets are read once (ffprobe on the container, no decoding): a few
+  seconds on a local file, but over a network drive the whole file is read, and with the NAS busy it was ~3 MB/s (a 8 GB film did
+  not finish in 15 minutes), so it runs in a thread and the comparison with the source is off by default. Not tried yet: a full
+  chart on the Loki file (the read did not finish). CSV autosave: the "Bitrate CSV" checkbox (default on, `opts["save_bitrate_csv"]`
+  — it must be in the dict built by `_avvia`, not only in the preview one) makes `converti_file()` start `save_bitrate_csv()` in a
+  thread, which writes `<output>_bitrate.csv` (1-minute steps, `bitrate_csv_text()`, times as h:mm:ss) next to the file, also in a
+  batch. Tried in the real app on a 130 s synthetic clip (libx265 -> mp4): the CSV appeared and the window opened at the end
 - `costruisci_filtri_video()` — builds the ffmpeg filter chain (scale/aspect-ratio/FPS/flip)
 - `bitrate_video_esatto()` — exact real video bitrate via summing packet sizes from ffprobe
   (`packet=size`), not an estimate from container-level bitrate minus audio (that approach was

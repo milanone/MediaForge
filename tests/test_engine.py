@@ -219,5 +219,70 @@ class PredictBitrate(unittest.TestCase):
         self.assertAlmostEqual(s["size_mb"], 573.33 * 1000 * 3000 / 8 / 1_048_576, places=1)
 
 
+class BitrateOverTime(unittest.TestCase):
+    @staticmethod
+    def packets(seconds, per_second, size_of):
+        """per_second packets every second, size given by size_of(second)."""
+        return [(s + i / per_second, size_of(s)) for s in range(seconds) for i in range(per_second)]
+
+    def test_constant_bitrate_gives_the_same_value_in_every_minute(self):
+        pk = self.packets(180, 24, lambda s: 1000)            # 24 packets/s x 1000 bytes = 192 kbps
+        out = mf.bucket_bitrates(pk, 60, 180)
+        self.assertEqual([t for t, _k in out], [0, 60, 120])
+        for _t, k in out:
+            self.assertAlmostEqual(k, 192.0, places=3)
+
+    def test_each_minute_has_its_own_value(self):
+        pk = self.packets(60, 10, lambda s: 3750) + [(60 + t, s) for t, s in self.packets(60, 10, lambda s: 4375)]
+        out = mf.bucket_bitrates(pk, 60, 120)                  # 10 x 3750 x 8 = 300 kbps, then 350 kbps
+        self.assertAlmostEqual(out[0][1], 300.0, places=3)
+        self.assertAlmostEqual(out[1][1], 350.0, places=3)
+
+    def test_last_partial_interval_uses_its_real_length(self):
+        out = mf.bucket_bitrates(self.packets(150, 10, lambda s: 1250), 60, 150)   # 100 kbps everywhere
+        self.assertEqual(len(out), 3)
+        self.assertAlmostEqual(out[2][1], 100.0, places=3)     # 30 s long, not diluted over 60 s
+
+    def test_a_tail_shorter_than_a_second_is_skipped(self):
+        out = mf.bucket_bitrates(self.packets(120, 10, lambda s: 1250) + [(120.2, 9999)], 60, 120.5)
+        self.assertEqual(len(out), 2)
+
+    def test_empty_and_bad_step(self):
+        self.assertEqual(mf.bucket_bitrates([], 60, 100), [])
+        self.assertEqual(mf.bucket_bitrates([(0.0, 10)], 0, 100), [])
+
+    def test_the_total_of_the_buckets_matches_the_total_size(self):
+        pk = self.packets(300, 24, lambda s: 500 + 40 * (s % 7))
+        out = mf.bucket_bitrates(pk, 30, 300)
+        total_bits = sum(k * 1000 * 30 for _t, k in out)
+        self.assertAlmostEqual(total_bits, sum(sz for _t, sz in pk) * 8, delta=1)
+
+    def test_csv_text(self):
+        data = [(0, 1234.56), (60, 800.0)]
+        self.assertEqual(mf.bitrate_csv_text(data, 60), "start;end;kbps\n0:00:00;0:01:00;1234.6\n0:01:00;0:02:00;800.0\n")
+        with_src = mf.bitrate_csv_text(data, 60, [(0, 2000.0)]).splitlines()
+        self.assertEqual(with_src[0], "start;end;kbps;source_kbps")
+        self.assertEqual(with_src[1].split(";")[-1], "2000.0")
+        self.assertEqual(with_src[2].split(";")[-1], "")      # a source shorter than the output: empty cell
+
+    def test_the_csv_is_saved_next_to_a_real_file(self):
+        import queue
+        import shutil
+        import subprocess
+        import tempfile
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = Path(tmp) / "clip.mkv"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24",
+                            "-t", "130", "-c:v", "mpeg4", str(dst)], check=True)
+            q = queue.Queue()
+            mf.save_bitrate_csv(dst, q)
+            lines = (Path(tmp) / "clip_bitrate.csv").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], "start;end;kbps")
+            self.assertEqual(len(lines), 4)                    # 0-1, 1-2 and the 10 s tail
+            self.assertEqual(q.get_nowait()[0], "detail")
+
+
 if __name__ == "__main__":
     unittest.main()

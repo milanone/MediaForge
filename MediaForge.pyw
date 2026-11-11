@@ -1966,6 +1966,11 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
                 pass
             br_txt = f"  {out_br // 1000} kbps" if out_br else ""
             log_q.put(("ok", f"  ✓ {dst.name}  [{size_src:.1f} MB → {size_dst:.1f} MB  {-risparmio:+.0f}%{br_txt}]"))
+            log_q.put(("chart", (str(dst), str(src))))   # bitrate over time: opens only for a single-file run
+            if opts.get("save_bitrate_csv"):
+                # in a thread: reading every packet of a long file over a network drive takes a while and must
+                # not hold up the next file of the batch
+                threading.Thread(target=save_bitrate_csv, args=(dst, log_q), daemon=True).start()
             return True
 
         except Exception as e:
@@ -2117,6 +2122,74 @@ def predict_bitrate(src: Path, opts: dict, n: int, clip_sec: float, start_text: 
     res = summarize_bitrates([k for _s, k in samples], duration)
     res.update(samples=samples, duration=duration)
     return res
+
+
+def read_video_packets(path: Path, timeout: int = 900) -> list:
+    """(time s, size bytes) of every packet of the first video stream, sorted by time: container-level
+    demuxing only (no decoding), a few seconds for a film on a local disk, longer over a network drive because the
+    whole file is read. The time is the pts, or the dts where a packet has no pts."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+           "packet=pts_time,dts_time,size", "-of", "csv=p=0", str(path)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                       stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split(",")
+        if len(parts) < 3:
+            continue
+        t = parts[0] if parts[0] not in ("", "N/A") else parts[1]
+        try:
+            out.append((float(t), int(parts[2])))
+        except ValueError:
+            continue
+    out.sort()
+    return out
+
+
+def bucket_bitrates(packets: list, step: float, duration: float = None) -> list:
+    """Video bitrate over the film time: [(start s, kbps)] for consecutive intervals of `step` seconds, from the
+    packet sizes (exact, not an estimate). The last interval is divided by its real length (not by `step`), and
+    skipped if it is shorter than a second."""
+    if not packets or step <= 0:
+        return []
+    t0 = packets[0][0]
+    total = max(duration or 0.0, packets[-1][0] - t0)
+    n = max(1, math.ceil(total / step - 1e-9))
+    sums = [0] * n
+    for t, size in packets:
+        sums[min(n - 1, int((t - t0) // step))] += size
+    out = []
+    for i, s in enumerate(sums):
+        length = min(step, total - i * step)
+        if length >= 1.0:
+            out.append((i * step, s * 8 / length / 1000))
+    return out
+
+
+def bitrate_csv_text(data: list, step: float, src_data: list = None) -> str:
+    """CSV text of the bitrate over time: `start;end;kbps[;source_kbps]`, times as h:mm:ss."""
+    lines = ["start;end;kbps" + (";source_kbps" if src_data else "")]
+    for i, (t, k) in enumerate(data):
+        row = f"{format_clock(t)};{format_clock(t + step)};{k:.1f}"
+        if src_data:
+            row += ";" + (f"{src_data[i][1]:.1f}" if i < len(src_data) else "")
+        lines.append(row)
+    return "\n".join(lines) + "\n"
+
+
+def save_bitrate_csv(dst: Path, log_q: queue.Queue, step: float = 60.0):
+    """Writes `<output>_bitrate.csv` (1-minute steps) next to a finished file. Runs in a thread; a failure only
+    produces a log line, never an error of the conversion."""
+    try:
+        data = bucket_bitrates(read_video_packets(dst), step,
+                               float(ffprobe_json(dst).get("format", {}).get("duration") or 0) or None)
+        if not data:
+            return
+        csv_path = dst.with_name(dst.stem + "_bitrate.csv")
+        csv_path.write_text(bitrate_csv_text(data, step), encoding="utf-8", newline="")
+        log_q.put(("detail", f"  bitrate values saved: {csv_path.name}"))
+    except Exception as e:
+        log_q.put(("detail", f"  bitrate CSV not saved: {e}"))
 
 
 def worker(files: list, opts: dict, log_q: queue.Queue, stop_ev: threading.Event):
@@ -2804,6 +2877,165 @@ def argomento_avvio():
     return Path.cwd(), None
 
 
+class BitrateChartWindow(tk.Toplevel):
+    """Video bitrate over the film time (minute 1: 3000 kbps, minute 2: 3500 kbps...), from the packet sizes of the
+    file (read_video_packets / bucket_bitrates). Opens by itself at the end of a single-file encode, and from the
+    "Bitrate chart" button for any file. Optionally compares with the source (one more read of that file, slow over
+    a network drive). The packets are read once: changing the interval only re-buckets them."""
+    STEPS = (("30 s", 30), ("1 min", 60), ("2 min", 120), ("5 min", 300))
+
+    def __init__(self, master, path: Path, src: Path = None):
+        super().__init__(master)
+        self.title(f"Bitrate over time — {path.name}")
+        self.geometry("980x480")
+        self._path, self._src = path, src
+        self._packets = {}      # path -> packets, read once
+        self._durations = {}
+        self._pending = None    # path being read, if any
+        self._q = queue.Queue()
+        self._data = []         # [(start s, kbps)] of the file
+        self._src_data = []
+        self._step = 60
+        top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=6)
+        ttk.Label(top, text="Interval:").pack(side="left")
+        self._var_step = tk.StringVar(value="1 min")
+        cb = ttk.Combobox(top, textvariable=self._var_step, values=[l for l, _ in self.STEPS], width=7,
+                          state="readonly")
+        cb.pack(side="left", padx=(4, 12))
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh())
+        self._var_src = tk.BooleanVar(value=False)
+        self._chk_src = ttk.Checkbutton(top, text="Compare with the source (reads the whole source: slow on a network drive)",
+                                        variable=self._var_src, command=self._refresh,
+                                        state="normal" if src else "disabled")
+        self._chk_src.pack(side="left")
+        ttk.Button(top, text="Save CSV…", command=self._save_csv).pack(side="right")
+        self._lbl = ttk.Label(self, text="Reading the packets…", foreground="gray")
+        self._lbl.pack(fill="x", padx=10)
+        self._cv = tk.Canvas(self, bg="white", highlightthickness=0)
+        self._cv.pack(fill="both", expand=True, padx=8, pady=8)
+        self._cv.bind("<Configure>", lambda _e: self._draw())
+        self._cv.bind("<Motion>", self._on_motion)
+        self._cv.bind("<Leave>", lambda _e: self._draw())
+        self._load(path)
+        self.after(150, self._poll)
+
+    def _load(self, path: Path):
+        if path in self._packets or self._pending:
+            return
+        self._pending = path
+
+        def run():
+            try:
+                packets = read_video_packets(path)
+                dur = float(ffprobe_json(path).get("format", {}).get("duration") or 0) or None
+            except Exception:
+                packets, dur = [], None
+            self._q.put((path, packets, dur))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _poll(self):
+        try:
+            path, packets, dur = self._q.get_nowait()
+        except queue.Empty:
+            if self.winfo_exists():
+                self.after(150, self._poll)
+            return
+        self._pending = None
+        self._packets[path], self._durations[path] = packets, dur
+        self._refresh()
+        if self.winfo_exists():
+            self.after(150, self._poll)
+
+    def _refresh(self):
+        self._step = dict(self.STEPS)[self._var_step.get()]
+        want_src = bool(self._src and self._var_src.get())
+        if want_src and self._src not in self._packets:
+            self._load(self._src)
+            self._lbl.configure(text="Reading the source file…")
+        pk = self._packets.get(self._path)
+        if pk is None:
+            return
+        self._data = bucket_bitrates(pk, self._step, self._durations.get(self._path))
+        sp = self._packets.get(self._src) if want_src else None
+        self._src_data = bucket_bitrates(sp, self._step, self._durations.get(self._src)) if sp else []
+        if not self._data:
+            self._lbl.configure(text="No video packets could be read from this file.")
+        else:
+            v = [k for _t, k in self._data]
+            total = sum(s for _t, s in pk) * 8 / max(1.0, self._durations.get(self._path) or pk[-1][0]) / 1000
+            self._lbl.configure(text=f"Mean {total:.0f} kbps · min {min(v):.0f} · max {max(v):.0f} "
+                                     f"(per {self._var_step.get()})  — hover the chart for a value")
+        self._draw()
+
+    def _geometry(self):
+        w, h = max(200, self._cv.winfo_width()), max(120, self._cv.winfo_height())
+        L, R, T, B = 62, 18, 14, 34
+        vals = [k for _t, k in self._data] + [k for _t, k in self._src_data]
+        hi = (max(vals) if vals else 1.0) * 1.1
+        end = max([t + self._step for t, _k in self._data] + [t + self._step for t, _k in self._src_data] + [1])
+        return w, h, L, R, T, B, hi, end
+
+    def _draw(self, hover=None):
+        cv = self._cv
+        cv.delete("all")
+        if not self._data:
+            return
+        w, h, L, R, T, B, hi, end = self._geometry()
+        X = lambda t: L + t / end * (w - L - R)
+        Y = lambda v: T + (1 - v / hi) * (h - T - B)
+        for i in range(5):
+            v = hi * i / 4
+            cv.create_line(L, Y(v), w - R, Y(v), fill="#e3e3e3")
+            cv.create_text(L - 6, Y(v), text=f"{v:.0f}", anchor="e", fill="#666", font=("Segoe UI", 8))
+        cv.create_text(6, T, text="kbps", anchor="nw", fill="#666", font=("Segoe UI", 8))
+        n_ticks = min(10, max(2, int(end // self._step)))
+        for i in range(n_ticks + 1):
+            t = end * i / n_ticks
+            cv.create_line(X(t), h - B, X(t), h - B + 4, fill="#999")
+            cv.create_text(X(t), h - B + 6, text=format_clock(t), anchor="n", fill="#666", font=("Segoe UI", 8))
+        for data, color in ((self._src_data, "#aaaaaa"), (self._data, "#1f6fd1")):
+            if len(data) >= 1:
+                pts = []
+                for t, k in data:
+                    pts += [X(t + self._step / 2), Y(k)]
+                if len(pts) >= 4:
+                    cv.create_line(*pts, fill=color, width=2, smooth=False)
+                else:
+                    cv.create_oval(pts[0] - 3, pts[1] - 3, pts[0] + 3, pts[1] + 3, fill=color, outline=color)
+        mean = sum(k for _t, k in self._data) / len(self._data)
+        cv.create_line(L, Y(mean), w - R, Y(mean), fill="#d1561f", dash=(5, 4))
+        cv.create_text(w - R, Y(mean) - 2, text=f"mean {mean:.0f}", anchor="se", fill="#d1561f", font=("Segoe UI", 8))
+        if self._src_data:
+            cv.create_text(L + 6, T + 2, text="blue = encoded file · grey = source", anchor="nw", fill="#666",
+                           font=("Segoe UI", 8))
+        if hover is not None:
+            cv.create_line(X(hover), T, X(hover), h - B, fill="#888", dash=(2, 3))
+
+    def _on_motion(self, event):
+        if not self._data:
+            return
+        w, h, L, R, T, B, hi, end = self._geometry()
+        t = (event.x - L) / max(1, (w - L - R)) * end
+        idx = max(0, min(len(self._data) - 1, int(t // self._step)))
+        start, kbps = self._data[idx]
+        text = f"{format_clock(start)} – {format_clock(start + self._step)}: {kbps:.0f} kbps"
+        if idx < len(self._src_data):
+            text += f"   (source {self._src_data[idx][1]:.0f} kbps)"
+        self._lbl.configure(text=text)
+        self._draw(hover=start + self._step / 2)
+
+    def _save_csv(self):
+        if not self._data:
+            return
+        name = filedialog.asksaveasfilename(parent=self, defaultextension=".csv", initialfile=f"{self._path.stem}_bitrate.csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if not name:
+            return
+        with open(name, "w", encoding="utf-8", newline="") as f:
+            f.write(bitrate_csv_text(self._data, self._step, self._src_data))
+
+
 class App(_BaseTk):
     def __init__(self):
         super().__init__()
@@ -2826,6 +3058,7 @@ class App(_BaseTk):
         self._bitrate_video_cache: dict = {}  # str(path) -> bit/s, vedi _ottieni_bitrate_video
         self._var_ss_on = None
         self._var_t_on  = None
+        self._run_files = 0             # how many files the current encode run has (the chart opens for 1)
         self._predict_running = False   # "Predict bitrate" test encodes in progress (see _predict_bitrate)
         self._predict_stop = None
         self._active_op = None  # None | "codifica" | "mux" | "capitoli": evita avvii concorrenti tra i tab
@@ -3124,6 +3357,12 @@ class App(_BaseTk):
         Tooltip(self._chk_two_pass, "Two passes: better bit distribution at the same average "
                 "bitrate, but about twice the time.\nOnly for software encoders (libx265, "
                 "libsvtav1): QSV/AMF/NVENC have no 2nd pass.")
+        self._var_bitrate_csv = tk.BooleanVar(value=True)
+        self._chk_bitrate_csv = ttk.Checkbutton(r1b, text="Bitrate CSV", variable=self._var_bitrate_csv)
+        self._chk_bitrate_csv.pack(side="left", padx=(12,0))
+        Tooltip(self._chk_bitrate_csv, "After each conversion, save the video bitrate per minute (exact, from the "
+                "packet sizes of the finished file) as <name>_bitrate.csv next to the output.\n"
+                "Done in the background; the same values are shown by the 'Bitrate chart' window.")
         Tooltip(self._spin_bitrate, "Average video bitrate (single-pass VBR, no 2-pass): the file "
                 "size is predictable but quality varies with the content. "
                 "Audio is not included.")
@@ -3679,6 +3918,7 @@ class App(_BaseTk):
             "preset":     self._preset_id(),
             "bitrate_kbps": self._bitrate_target(),
             "two_pass":   self._var_two_pass.get(),
+            "save_bitrate_csv": self._var_bitrate_csv.get(),
             "gpu_decode": self._var_gpu_decode.get(),
             "limit_fps":  self._var_limit_fps.get(),
             "fps_value":  self._var_fps.get(),
@@ -3897,6 +4137,12 @@ class App(_BaseTk):
             Tooltip(btn_fps, "Counts the real (non-duplicated) frames on 5 short clips and compares\n"
                              "them with the declared rate: e.g. a 24 fps film stored as 30 fps\n"
                              "with repeated frames. Then sets the FPS limit consistently.")
+        if video is not None:
+            btn_chart = ttk.Button(btn_frame, text="📈 Bitrate chart",
+                                   command=lambda: BitrateChartWindow(self, path))
+            btn_chart.pack(side="left", padx=(0, 12))
+            Tooltip(btn_chart, "Video bitrate over the film time (per minute, from the real packet sizes) of this file.\n"
+                               "It also opens by itself at the end of a single-file encode, with the source for comparison.")
         ttk.Button(btn_frame, text="Seleziona tutti", width=15,
                    command=lambda: self._imposta_tutti_stream(True)).pack(side="left", padx=(0,4))
         ttk.Button(btn_frame, text="Deseleziona tutti", width=17,
@@ -4791,6 +5037,7 @@ class App(_BaseTk):
             "preset":     self._preset_id(),
             "bitrate_kbps": self._bitrate_target(),
             "two_pass":   self._var_two_pass.get(),
+            "save_bitrate_csv": self._var_bitrate_csv.get(),
             "gpu_decode": self._var_gpu_decode.get(),
             "hflip":      self._var_hflip.get(),
             "vflip":      self._var_vflip.get(),
@@ -4833,6 +5080,7 @@ class App(_BaseTk):
         self._btn_stop.configure(state="normal")
         self._btn_finish.configure(state="normal")
         self._lbl_stato.config(text="In corso…")
+        self._run_files = len(files)
 
         threading.Thread(
             target=worker,
@@ -5574,6 +5822,11 @@ class App(_BaseTk):
                 tag, msg = self._log_q.get_nowait()
                 if tag == "encoders":
                     self._applica_rilevamento(msg)
+                elif tag == "chart":
+                    # end of an encode: the bitrate chart opens by itself for a single-file run (with a batch it
+                    # would open one window per file: use the "Bitrate chart" button instead)
+                    if self._run_files == 1:
+                        BitrateChartWindow(self, Path(msg[0]), Path(msg[1]))
                 elif tag == "predict_status":
                     if self._predict_running:   # a late line must not overwrite the final result
                         self._lbl_predict.configure(text=msg)   # "Predict bitrate" progress, see predict_bitrate
