@@ -284,5 +284,96 @@ class BitrateOverTime(unittest.TestCase):
             self.assertEqual(q.get_nowait()[0], "detail")
 
 
+class LiveCharts(unittest.TestCase):
+    LINE = "frame=  240 fps= 48 q=-1.0 size=    1024KiB time=00:00:10.00 bitrate= 838.9kbits/s speed=1.98x"
+
+    def test_parse_progress_line(self):
+        st = mf.parse_progress_line(self.LINE)
+        self.assertEqual((st["frame"], st["fps"], st["size_bytes"], st["time_s"], st["bitrate_kbps"], st["speed"]),
+                         (240, 48.0, 1024 * 1024, 10.0, 838.9, 1.98))
+        na = mf.parse_progress_line("frame=    1 fps=0.0 q=0.0 size=       0KiB time=N/A bitrate=N/A speed=N/A")
+        self.assertIsNone(na["time_s"])
+        self.assertIsNone(na["bitrate_kbps"])
+        self.assertIsNone(mf.parse_progress_line("Stream mapping:"))
+
+    def test_audio_output_kbps(self):
+        a = {"codec_type": "audio", "bit_rate": "640000"}
+        b = {"codec_type": "audio", "tags": {"BPS": "384000"}}
+        c = {"codec_type": "audio"}
+        v = {"codec_type": "video"}
+        data = {"streams": [v, a, b]}
+        self.assertEqual(mf.audio_output_kbps({"audio": "copy"}, data), 1024)
+        self.assertEqual(mf.audio_output_kbps({"audio": "ac3"}, data), 768)       # re-encoded: 384 each, not 640
+        self.assertEqual(mf.audio_output_kbps({"audio": "aac"}, data), 256)
+        self.assertEqual(mf.audio_output_kbps({"audio": "copy", "stream_map": [0, 1]}, data), 640)
+        self.assertEqual(mf.audio_output_kbps({"audio": "ac3", "stream_map": [0, 2]}, data), 384)
+        self.assertIsNone(mf.audio_output_kbps({"audio": "copy"}, {"streams": [v, a, c]}))   # not declared
+        self.assertIsNone(mf.audio_output_kbps({"audio": "copy", "mode": "audio"}, data))     # audio-only job
+        self.assertEqual(mf.audio_output_kbps({"audio": "copy"}, {"streams": [v]}), 0.0)
+
+    def test_samples_subtract_the_audio_and_measure_the_last_seconds(self):
+        import queue
+        q = queue.Queue()
+        live = mf.LiveStats(q)
+        live.next_segment(384.0)
+
+        def line(t, kib):
+            return f"frame= 1 fps=24 q=0 size={kib}KiB time=00:00:{t:02d}.00 bitrate=999.0kbits/s speed=1.0x"
+        now = 1000.0
+        self.assertIsNotNone(live.add(line(10, 500), now))
+        self.assertIsNone(live.add(line(11, 520), now + 3))           # less than HISTORY_STEP after the last one
+        for i in range(1, 4):
+            live.add(line(10 + 10 * i, 500 + 600 * i), now + 10 * i)   # 600 KiB every 10 s of film
+        s = live.history[-1]
+        self.assertEqual(s["pass"], 1)
+        self.assertEqual(s["audio_kbps"], 384.0)
+        self.assertAlmostEqual(s["avg_kbps"], 999.0 - 384.0)
+        self.assertAlmostEqual(s["inst_kbps"], 600 * 1024 * 8 / 10 / 1000 - 384.0, places=3)   # 491.52 - 384
+        self.assertEqual(q.get_nowait()[0], "live")
+        # a new attempt restarts time=: the old samples are not used as the reference
+        live.next_segment(0.0)
+        live.add(line(10, 100), now + 40)
+        self.assertEqual(live.history[-1]["pass"], 2)
+        self.assertIsNone(live.history[-1]["inst_kbps"])
+
+    def test_unknown_audio_subtracts_nothing(self):
+        import queue
+        live = mf.LiveStats(queue.Queue())
+        live.next_segment(None)
+        live.add("frame= 1 fps=24 q=0 size=100KiB time=00:00:05.00 bitrate=700.0kbits/s speed=1.0x", 50.0)
+        self.assertEqual(live.history[0]["avg_kbps"], 700.0)
+        self.assertIsNone(live.history[0]["audio_kbps"])
+
+    def test_a_real_ffmpeg_run_feeds_the_live_charts(self):
+        import queue
+        import shutil
+        import subprocess
+        import tempfile
+        import threading
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not available")
+        q = queue.Queue()
+        live = mf.LiveStats(q)
+        live.next_segment(0.0)
+        old = mf.HISTORY_STEP
+        mf.HISTORY_STEP = 0                        # every progress line becomes a sample
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cmd = ["ffmpeg", "-y", "-re", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-t", "5",
+                       "-c:v", "mpeg4", str(Path(tmp) / "out.mkv")]
+                esito, _rc = mf.esegui_ffmpeg_con_watchdog(cmd, q, threading.Event(), live=live)
+        finally:
+            mf.HISTORY_STEP = old
+        self.assertEqual(esito, "ok")
+        msgs = []
+        while not q.empty():
+            msgs.append(q.get_nowait())
+        samples = [m for tag, m in msgs if tag == "live"]
+        self.assertGreaterEqual(len(samples), 2)
+        self.assertIsNotNone(samples[-1]["fps"])
+        self.assertIsNotNone(samples[-1]["avg_kbps"])
+        self.assertTrue(all(s["pass"] == 1 for s in samples))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -104,6 +104,16 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   — it must be in the dict built by `_avvia`, not only in the preview one) makes `converti_file()` start `save_bitrate_csv()` in a
   thread, which writes `<output>_bitrate.csv` (1-minute steps, `bitrate_csv_text()`, times as h:mm:ss) next to the file, also in a
   batch. Tried in the real app on a 130 s synthetic clip (libx265 -> mp4): the CSV appeared and the window opened at the end
+- Live charts (`LiveStats`, `LiveChartWindow`): while a file encodes, a window shows encoding speed (fps), speed against
+  real time and the video bitrate (instantaneous over the last ~20 s, and average), x axis = time elapsed since the file
+  started, a dashed line at each new pass or retry. Same method as the web (`record_progress`): ffmpeg's `size=`/`bitrate=`
+  cover the whole file, so `audio_output_kbps()` is subtracted (re-encoded tracks count their NEW bitrate, 384 for AC-3, not
+  the source's 640; copied tracks their declared bitrate; unknown -> nothing subtracted and the title says "video + audio";
+  right for constant-bitrate audio, an estimate for TrueHD/FLAC/DTS-HD). `converti_file()` puts one `LiveStats` in
+  `opts["live"]` (it travels through the 2-pass copy), the watchdog feeds it every progress line, a sample goes to the GUI
+  every `HISTORY_STEP` = 10 s as `("live", sample)`; `("live_start", name)` opens or clears the window (closed by the
+  user = it stays closed until the next Start). Not for Predict bitrate. Tried in the real app on a 100 s 720p clip
+  (libx265, audio AC-3 640k 5.1 -> 384k): 8 samples, title "384 kbps of audio subtracted". Not tried: 2-pass, a retry, a batch
 - `costruisci_filtri_video()` — builds the ffmpeg filter chain (scale/aspect-ratio/FPS/flip)
 - `bitrate_video_esatto()` — exact real video bitrate via summing packet sizes from ffprobe
   (`packet=size`), not an estimate from container-level bitrate minus audio (that approach was
@@ -222,6 +232,7 @@ enforces the "same" rows.
 | GPU decoder drops frames (error lines in the ffmpeg log) | stops the attempt, software fallback by itself | warning in the page: continue / stop / redo in software | different on purpose (software is very slow on gaia) |
 | GPU path | direct QSV first (`-hwaccel qsv`, as the web), then `d3d11va` + `hwmap`, then software | `-hwaccel qsv`, then software | same first choice; the extra d3d11va step exists only on Windows |
 | Default CRF for a 4K source scaled down (QSV) | 14 (`QSV_CRF_DOWNSCALED_4K`, via `crf_suggerito(source_side=)`) | 14 (`QSV_CRF_DOWNSCALED_4K` in `index.html`; the page now also feeds the OUTPUT size after the resolution cap, as the desktop does) | same (tested through node) |
+| Live charts while encoding (fps, speed, video bitrate instantaneous + average, audio subtracted) | `LiveStats`, `parse_progress_line()`, `audio_output_kbps()`, `LiveChartWindow` (a separate window) | `record_progress()`, `parse_progress_line()`, `audio_output_kbps()`, `drawChart()` (inside the page) | same numbers and rules (tested against each other); the desktop shows them in a window, the web in the page |
 | Predict bitrate (N clips of X min, random or typed times, mean/min/max, predicted size) | `predict_bitrate()` | `/api/predict`, `run_predict()` | same method (start-time and summary functions tested against each other); the web runs it as a hidden job and has no software fallback beyond software decoding |
 | Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
 | Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |

@@ -1668,9 +1668,145 @@ GPU_DECODE_ERRORS = ("Static surface pool size exceeded", "Error submitting pack
                      "get_buffer() failed")
 
 
+# --- Live progress charts (fps, speed, bitrate while encoding). Same numbers and rules as mediaforge-web
+# (parse_progress_line, audio_output_kbps, record_progress there): keep the two in step, test_parity.py checks it.
+TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+_FIELD_RE = re.compile(r"(frame|fps|size|Lsize|time|bitrate|speed)=\s*(\S+)")
+_SIZE_RE = re.compile(r"([\d.]+)\s*(B|kB|KiB|mB|MiB|gB|GiB)")
+_SIZE_MULT = {"B": 1, "kB": 1024, "KiB": 1024, "mB": 1024 ** 2, "MiB": 1024 ** 2, "gB": 1024 ** 3, "GiB": 1024 ** 3}
+HISTORY_STEP = 10       # seconds between the samples kept for the charts
+HISTORY_MAX = 4000      # about 11 hours of job
+# Bitrate of the re-encoded audio tracks (the same fixed values build_ffmpeg_cmd passes to -b:a)
+AUDIO_REENCODE_KBPS = {"aac": 128, "ac3": 384, "mp3": 128}
+
+
+def parse_progress_line(line):
+    """Numbers of an ffmpeg progress line as a dict (frame, fps, size_bytes, time_s, bitrate_kbps, speed; None when
+    "N/A"), or None if the line is not a progress line."""
+    if "frame=" not in line or "time=" not in line:
+        return None
+    raw = {k: v for k, v in _FIELD_RE.findall(line)}
+    out = {"frame": None, "fps": None, "size_bytes": None, "time_s": None, "bitrate_kbps": None, "speed": None}
+    try:
+        if raw.get("frame", "N/A") != "N/A":
+            out["frame"] = int(raw["frame"])
+        if raw.get("fps", "N/A") != "N/A":
+            out["fps"] = float(raw["fps"])
+        size = raw.get("size") or raw.get("Lsize")
+        m = _SIZE_RE.fullmatch(size) if size else None
+        if m:
+            out["size_bytes"] = int(float(m.group(1)) * _SIZE_MULT[m.group(2)])
+        m = TIME_RE.fullmatch("time=" + raw["time"]) if raw.get("time") else None
+        if m:
+            h, mnt, sec, frac = m.groups()
+            out["time_s"] = int(h) * 3600 + int(mnt) * 60 + int(sec) + float("0." + frac)
+        b = raw.get("bitrate", "")
+        if b.endswith("kbits/s"):
+            out["bitrate_kbps"] = float(b[:-7])
+        sp = raw.get("speed", "")
+        if sp.endswith("x") and sp[:-1] not in ("", "N/A"):
+            out["speed"] = float(sp[:-1])
+    except (ValueError, KeyError):
+        return None
+    return out
+
+
+def declared_stream_bitrate(stream):
+    """Bitrate (bit/s) already declared in the file for a stream, without computing it: ffprobe's bit_rate field or,
+    failing that, the BPS / BPS-eng tags (mkv). None when nothing is declared."""
+    if not stream:
+        return None
+    br = stream.get("bit_rate")
+    if br:
+        try:
+            return int(br)
+        except (TypeError, ValueError):
+            pass
+    tags = stream.get("tags", {}) or {}
+    for key in ("BPS", "BPS-eng"):
+        if tags.get(key):
+            try:
+                return int(tags[key])
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def audio_output_kbps(opts: dict, data: dict):
+    """kbps of the audio tracks that end up in the output file: the declared bitrate of each copied track, the fixed
+    bitrate of each re-encoded one (AUDIO_REENCODE_KBPS, so AC-3 640 -> 384 counts 384). ffmpeg's progress line
+    (size=, bitrate=) covers the WHOLE output file, so the live chart subtracts this to show the video bitrate.
+    Audio is usually constant bitrate (AC-3, E-AC-3, AAC), so a constant is a good estimate; it is not for lossless
+    or VBR audio (TrueHD, FLAC, DTS-HD). None when it cannot be known (audio-only job, or a copied track with no
+    declared bitrate): nothing is then subtracted and the chart says it includes the audio."""
+    if opts.get("mode") == "audio":
+        return None
+    streams = data.get("streams", [])
+    audio = [(i, s) for i, s in enumerate(streams) if s.get("codec_type") == "audio"]
+    if opts.get("stream_map"):
+        audio = [(i, s) for i, s in audio if i in opts["stream_map"]]
+    mode = opts.get("audio", "copy")
+    if mode in AUDIO_REENCODE_KBPS:
+        return float(len(audio) * AUDIO_REENCODE_KBPS[mode])
+    total = 0.0
+    for _i, s in audio:
+        br = declared_stream_bitrate(s)
+        if br is None:
+            return None
+        total += br / 1000
+    return total
+
+
+class LiveStats:
+    """Collects the progress lines of the ffmpeg attempts of one file (one per pass / retry) into samples for the live
+    charts. Every HISTORY_STEP seconds one sample goes to the GUI as ("live", sample). The instantaneous bitrate is
+    measured over the last ~20 s, because ffmpeg's own "bitrate" is the average since the start and the output size
+    grows in coarse steps. Same method as record_progress in mediaforge-web."""
+
+    def __init__(self, log_q: queue.Queue):
+        self.log_q = log_q
+        self.t0 = time.time()
+        self.history = []
+        self.segment = 0          # one per ffmpeg attempt (pass 1, pass 2, a retry...): charts mark the change
+        self.audio_kbps = None    # None = unknown (nothing subtracted)
+        self._last = 0.0
+
+    def next_segment(self, audio_kbps):
+        """Call before each ffmpeg attempt: its time= restarts from zero and its audio may differ (pass 1 has none)."""
+        self.segment += 1
+        self.audio_kbps = audio_kbps
+
+    def add(self, line: str, now: float = None):
+        st = parse_progress_line(line)
+        if st is None:
+            return None
+        now = time.time() if now is None else now
+        if now - self._last < HISTORY_STEP or len(self.history) >= HISTORY_MAX:
+            return None
+        self._last = now
+        audio = self.audio_kbps or 0
+        inst = None
+        recent = [h for h in self.history[-3:] if h["pass"] == self.segment]
+        ref = self.history[-3] if len(self.history) >= 3 and self.history[-3]["pass"] == self.segment \
+            else (recent[-1] if recent else None)
+        # ffmpeg can print time=N/A in the first lines (e.g. after -ss): the reference sample may have no time
+        if (ref and st["time_s"] is not None and st["size_bytes"] is not None and ref["size"] is not None
+                and ref["time_s"] is not None):
+            dt = st["time_s"] - ref["time_s"]
+            if dt > 1:
+                inst = max(0.0, (st["size_bytes"] - ref["size"]) * 8 / dt / 1000 - audio)
+        avg = max(0.0, st["bitrate_kbps"] - audio) if st["bitrate_kbps"] is not None else None
+        sample = {"t": round(now - self.t0, 1), "pass": self.segment, "time_s": st["time_s"], "fps": st["fps"],
+                  "speed": st["speed"], "avg_kbps": avg, "inst_kbps": inst, "size": st["size_bytes"],
+                  "audio_kbps": self.audio_kbps}
+        self.history.append(sample)
+        self.log_q.put(("live", sample))
+        return sample
+
+
 def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading.Event,
                                 timeout_stallo: float = 5.0, finish_ev: threading.Event = None,
-                                fatal_patterns: tuple = ()):
+                                fatal_patterns: tuple = (), live: "LiveStats" = None):
     """Lancia ffmpeg, inoltra al log le righe di progresso (frame/fps/time/
     speed) e di dettaglio, e ne segue l'esito. Oltre all'interruzione manuale
     (stop_ev) e al codice di uscita, rileva uno STALLO: se il valore di
@@ -1691,6 +1827,7 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
     fatal_patterns: se una riga di ffmpeg ne contiene una, ffmpeg viene fermato subito con esito
     "errore" (il file sarebbe danneggiato anche se ffmpeg finirebbe con codice 0): serve a far
     scattare il ripiego in software invece di codificare per ore un video con fotogrammi persi.
+    live (opzionale): LiveStats che riceve le righe di progresso per i grafici in diretta.
     Ritorna (esito, returncode) con esito in "ok"/"interrotto"/"stallo"/"errore"/
     "terminato" (chiuso in modo pulito su richiesta di finish_ev)."""
     proc = subprocess.Popen(
@@ -1760,6 +1897,8 @@ def esegui_ffmpeg_con_watchdog(cmd: list, log_q: queue.Queue, stop_ev: threading
             ultimo_progresso = time.monotonic()
         if any(k in line for k in ("frame=", "fps=", "time=", "speed=")):
             log_q.put(("progress", line))
+            if live is not None:
+                live.add(line)
         elif line:
             log_q.put(("detail", "  " + line))
         if fatal_patterns and any(pat in line for pat in fatal_patterns):
@@ -1820,9 +1959,12 @@ def converti_2_passate(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threa
                                hwaccel_decode=False)
         log_q.put(("detail", "  Pass 1/2 (analysis)"))
         log_q.put(("cmd", "  $ " + " ".join(cmd)))
+        live = opts.get("live")
+        if live is not None:
+            live.next_segment(0.0)          # pass 1 writes no audio (-an)
         esito, returncode = esegui_ffmpeg_con_watchdog(
             cmd, log_q, stop_ev, timeout_stallo=timeout_stallo,
-            finish_ev=opts.get("finish_ev"))
+            finish_ev=opts.get("finish_ev"), live=live)
         if esito == "interrotto":
             log_q.put(("detail", "  Interrotto dall'utente."))
             return False
@@ -1840,6 +1982,11 @@ def converti_2_passate(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threa
 
 def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.Event,
                    timeout_stallo: float = 5.0) -> bool:
+    if opts.get("live") is None and not opts.get("pass_num"):
+        # live charts of this file: one LiveStats shared by every pass and retry (it travels in opts, which
+        # converti_2_passate copies); the GUI starts a fresh chart on "live_start"
+        opts = dict(opts, live=LiveStats(log_q))
+        log_q.put(("live_start", src.name))
     if usa_2_passate(opts) and not opts.get("pass_num"):
         return converti_2_passate(src, opts, log_q, stop_ev, timeout_stallo)
     ext = opts["output_ext"]
@@ -1894,10 +2041,13 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
                 log_q.put(("warning", f"  ⚠ {w}"))
             log_q.put(("cmd", "  $ " + " ".join(cmd)))
 
+            live = opts.get("live")
+            if live is not None:
+                live.next_segment(audio_output_kbps(opts_encode, data))
             esito, returncode = esegui_ffmpeg_con_watchdog(
                 cmd, log_q, stop_ev, timeout_stallo=timeout_stallo,
                 finish_ev=opts.get("finish_ev"),
-                fatal_patterns=GPU_DECODE_ERRORS if "-hwaccel" in cmd else ())
+                fatal_patterns=GPU_DECODE_ERRORS if "-hwaccel" in cmd else (), live=live)
 
             if esito == "interrotto":
                 log_q.put(("detail", "  Interrotto dall'utente."))
@@ -2881,6 +3031,100 @@ def argomento_avvio():
     return Path.cwd(), None
 
 
+class LiveChartWindow(tk.Toplevel):
+    """Charts of the encode in progress, the same three as the web page: encoding speed (fps), speed against real
+    time (x) and the video bitrate (instantaneous and average, with the audio subtracted: see audio_output_kbps).
+    Fed by the ("live", sample) messages of LiveStats; a new file clears it ("live_start"). The x axis is the time
+    elapsed since the file started (a dashed line marks a new pass or retry)."""
+    CHARTS = (
+        ("fps", "Encoding speed (frames per second)", "fps", 0, (("fps", "#1f6fd1", 2),)),
+        ("speed", "Speed against real time (x)", "x", 2, (("speed", "#1f6fd1", 2),)),
+        ("bitrate", "Video bitrate (kbps)", "kbps", 0, (("inst_kbps", "#1f6fd1", 2), ("avg_kbps", "#999999", 1))),
+    )
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.geometry("720x720")
+        self._samples = []
+        self._cv, self._lbl, self._head = {}, {}, {}
+        for key, title, _u, _d, _s in self.CHARTS:
+            box = ttk.Frame(self); box.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+            top = ttk.Frame(box); top.pack(fill="x")
+            self._head[key] = ttk.Label(top, text=title, font=("Segoe UI", 9, "bold")); self._head[key].pack(side="left")
+            self._lbl[key] = ttk.Label(top, text="", foreground="gray"); self._lbl[key].pack(side="right")
+            cv = tk.Canvas(box, bg="white", highlightthickness=1, highlightbackground="#d0d0d0", height=150)
+            cv.pack(fill="both", expand=True)
+            cv.bind("<Configure>", lambda _e: self._draw_all())
+            self._cv[key] = cv
+        ttk.Label(self, text="Bitrate: blue = instantaneous (last ~20 s), grey = average since the start",
+                  foreground="gray").pack(fill="x", padx=10, pady=(2, 6))
+        self.reset("")
+
+    def reset(self, name: str):
+        self._samples = []
+        self.title(f"Encoding progress — {name}" if name else "Encoding progress")
+        self._draw_all()
+
+    def add(self, sample: dict):
+        self._samples.append(sample)
+        self._draw_all()
+
+    def _bitrate_title(self):
+        audio = self._samples[-1].get("audio_kbps") if self._samples else 0
+        if audio is None:
+            return "File bitrate, video + audio (kbps)"
+        if audio > 0:
+            return f"Video bitrate (kbps, {audio:.0f} kbps of audio subtracted)"
+        return "Video bitrate (kbps)"
+
+    def _draw_all(self):
+        if self._samples:
+            self._head["bitrate"].configure(text=self._bitrate_title())
+        for key, _title, unit, dec, series in self.CHARTS:
+            self._draw(key, unit, dec, series)
+
+    def _draw(self, key, unit, dec, series):
+        cv, pts = self._cv[key], self._samples
+        cv.delete("all")
+        self._lbl[key].configure(text="")
+        vals = [p[k] for k, _c, _w in series for p in pts if p.get(k) is not None]
+        if len(pts) < 2 or not vals:
+            return
+        w, h = max(200, cv.winfo_width()), max(80, cv.winfo_height())
+        L, R, T, B = 52, 12, 8, 22
+        lo, hi = min(vals), max(vals)
+        if hi - lo < 1e-9:
+            hi, lo = hi + 1, lo - 1
+        pad = (hi - lo) * 0.1
+        lo, hi = max(0.0, lo - pad), hi + pad
+        x0, x1 = pts[0]["t"], max(pts[-1]["t"], pts[0]["t"] + 1)
+        X = lambda t: L + (t - x0) / (x1 - x0) * (w - L - R)
+        Y = lambda v: T + (1 - (v - lo) / (hi - lo)) * (h - T - B)
+        for v in (lo, (lo + hi) / 2, hi):
+            cv.create_line(L, Y(v), w - R, Y(v), fill="#e3e3e3")
+            cv.create_text(L - 6, Y(v), text=f"{v:.{dec}f}", anchor="e", fill="#666", font=("Segoe UI", 8))
+        n = 5
+        for i in range(n + 1):             # time axis: elapsed time since the file started
+            t = x0 + (x1 - x0) * i / n
+            cv.create_line(X(t), h - B, X(t), h - B + 4, fill="#999")
+            cv.create_text(X(t), h - B + 6, text=format_clock(t), anchor="ne" if i == n else "n", fill="#666",
+                           font=("Segoe UI", 8))
+        for i in range(1, len(pts)):
+            if pts[i]["pass"] != pts[i - 1]["pass"]:
+                cv.create_line(X(pts[i]["t"]), T, X(pts[i]["t"]), h - B, fill="#999", dash=(3, 3))
+        for k, color, width in series:
+            line = []
+            for p in pts:
+                if p.get(k) is not None:
+                    line += [X(p["t"]), Y(p[k])]
+            if len(line) >= 4:
+                cv.create_line(*line, fill=color, width=width)
+        main = [p[series[0][0]] for p in pts if p.get(series[0][0]) is not None]
+        if main:
+            self._lbl[key].configure(text=f"now {main[-1]:.{dec}f} {unit} · mean {sum(main) / len(main):.{dec}f}"
+                                          f" · min {min(main):.{dec}f} · max {max(main):.{dec}f}")
+
+
 class BitrateChartWindow(tk.Toplevel):
     """Video bitrate over the film time (minute 1: 3000 kbps, minute 2: 3500 kbps...), from the packet sizes of the
     file (read_video_packets / bucket_bitrates). Opens by itself at the end of a single-file encode, and from the
@@ -3062,6 +3306,8 @@ class App(_BaseTk):
         self._bitrate_video_cache: dict = {}  # str(path) -> bit/s, vedi _ottieni_bitrate_video
         self._var_ss_on = None
         self._var_t_on  = None
+        self._live_win = None           # LiveChartWindow of the encode in progress (None until the first one)
+        self._live_run_new = False      # True from "Start" until the live window of this run is opened
         self._run_files = 0             # how many files the current encode run has (the chart opens for 1)
         self._predict_running = False   # "Predict bitrate" test encodes in progress (see _predict_bitrate)
         self._predict_stop = None
@@ -5085,6 +5331,7 @@ class App(_BaseTk):
         self._btn_finish.configure(state="normal")
         self._lbl_stato.config(text="In corso…")
         self._run_files = len(files)
+        self._live_run_new = True
 
         threading.Thread(
             target=worker,
@@ -5826,6 +6073,19 @@ class App(_BaseTk):
                 tag, msg = self._log_q.get_nowait()
                 if tag == "encoders":
                     self._applica_rilevamento(msg)
+                elif tag == "live_start":
+                    # a file starts: open the live charts (or clear them), unless the user closed the window
+                    # earlier in this run, in which case it only comes back with the next run
+                    if self._live_win is not None and self._live_win.winfo_exists():
+                        self._live_run_new = False
+                        self._live_win.reset(msg)
+                    elif self._live_run_new:
+                        self._live_run_new = False
+                        self._live_win = LiveChartWindow(self)
+                        self._live_win.reset(msg)
+                elif tag == "live":
+                    if self._live_win is not None and self._live_win.winfo_exists():
+                        self._live_win.add(msg)
                 elif tag == "chart":
                     # end of an encode: the bitrate chart opens by itself for a single-file run (with a batch it
                     # would open one window per file: use the "Bitrate chart" button instead)

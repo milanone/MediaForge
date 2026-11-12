@@ -46,6 +46,8 @@ control the playback side, not a safe default otherwise.
   you type; a dice button draws a new set of random points each time) with the current settings and shows the bitrate of each, the mean, min and max, and the
   video size the mean predicts for the whole file. It is an estimate: at the same CRF the bitrate
   differs a lot between scenes, so look at min and max, not only the mean
+- Live charts: while a file encodes, a window plots encoding speed (fps), speed against real time and the video bitrate
+  (instantaneous and average; the audio is subtracted from ffmpeg's whole-file figure), with elapsed time on the x axis
 - Bitrate over time: after a single-file conversion a window shows the exact video bitrate per minute (30 s to 5 min steps,
   optional comparison with the source, "Save CSV…"; also from the "📈 Bitrate chart" button for any file). The "Bitrate CSV"
   checkbox (on by default) also saves the same values as `<name>_bitrate.csv` next to every converted file
