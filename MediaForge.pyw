@@ -3032,6 +3032,13 @@ def argomento_avvio():
     return Path.cwd(), None
 
 
+def live_chart_points(samples: list) -> list:
+    """The samples the live charts draw: the first one of every pass or retry is left out, because it is taken while the
+    encoder is still starting up (fps, speed and bitrate are far from the steady values) and it squashes the rest of
+    the chart. The samples themselves are kept as they are."""
+    return [p for i, p in enumerate(samples) if i > 0 and p["pass"] == samples[i - 1]["pass"]]
+
+
 class LiveChartWindow(tk.Toplevel):
     """Charts of the encode in progress, the same three as the web page: encoding speed (fps), speed against real
     time (x) and the video bitrate (instantaneous and average, with the audio subtracted: see audio_output_kbps).
@@ -3085,7 +3092,7 @@ class LiveChartWindow(tk.Toplevel):
             self._draw(key, unit, dec, series)
 
     def _draw(self, key, unit, dec, series):
-        cv, pts = self._cv[key], self._samples
+        cv, pts = self._cv[key], live_chart_points(self._samples)
         cv.delete("all")
         self._lbl[key].configure(text="")
         vals = [p[k] for k, _c, _w in series for p in pts if p.get(k) is not None]

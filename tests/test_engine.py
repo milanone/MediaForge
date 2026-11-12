@@ -337,6 +337,12 @@ class LiveCharts(unittest.TestCase):
         self.assertEqual(live.history[-1]["pass"], 2)
         self.assertIsNone(live.history[-1]["inst_kbps"])
 
+    def test_the_first_sample_of_every_pass_is_not_drawn(self):
+        s = [{"pass": 1, "t": 0}, {"pass": 1, "t": 10}, {"pass": 1, "t": 20}, {"pass": 2, "t": 30}, {"pass": 2, "t": 40}]
+        self.assertEqual([p["t"] for p in mf.live_chart_points(s)], [10, 20, 40])
+        self.assertEqual(mf.live_chart_points(s[:1]), [])
+        self.assertEqual(len(s), 5)                       # the samples themselves are untouched
+
     def test_unknown_audio_subtracts_nothing(self):
         import queue
         live = mf.LiveStats(queue.Queue())
