@@ -102,7 +102,7 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   not finish in 15 minutes), so it runs in a thread and the comparison with the source is off by default. Not tried yet: a full
   chart on the Loki file (the read did not finish). CSV autosave: the "Bitrate CSV" checkbox (default on, `opts["save_bitrate_csv"]`
   — it must be in the dict built by `_avvia`, not only in the preview one) makes `converti_file()` start `save_bitrate_csv()` in a
-  thread, which writes `<output>_bitrate.csv` (1-minute steps, `bitrate_csv_text()`, times as h:mm:ss) next to the file, also in a
+  thread, which writes `<output>_bitrate.csv` (1-minute steps, `bitrate_csv_text()`: comma-separated `time,kbps[,source_kbps]`, one time column = the middle of each interval, as h:mm:ss) next to the file, also in a
   batch. Tried in the real app on a 130 s synthetic clip (libx265 -> mp4): the CSV appeared and the window opened at the end
 - Live charts (`LiveStats`, `LiveChartWindow`): while a file encodes, a window shows encoding speed (fps), speed against
   real time and the video bitrate (instantaneous over the last ~20 s, and average), x axis = time elapsed since the file

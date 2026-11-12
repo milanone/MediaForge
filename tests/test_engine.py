@@ -259,11 +259,11 @@ class BitrateOverTime(unittest.TestCase):
 
     def test_csv_text(self):
         data = [(0, 1234.56), (60, 800.0)]
-        self.assertEqual(mf.bitrate_csv_text(data, 60), "start;end;kbps\n0:00:00;0:01:00;1234.6\n0:01:00;0:02:00;800.0\n")
+        self.assertEqual(mf.bitrate_csv_text(data, 60), "time,kbps\n0:00:30,1234.6\n0:01:30,800.0\n")
         with_src = mf.bitrate_csv_text(data, 60, [(0, 2000.0)]).splitlines()
-        self.assertEqual(with_src[0], "start;end;kbps;source_kbps")
-        self.assertEqual(with_src[1].split(";")[-1], "2000.0")
-        self.assertEqual(with_src[2].split(";")[-1], "")      # a source shorter than the output: empty cell
+        self.assertEqual(with_src[0], "time,kbps,source_kbps")
+        self.assertEqual(with_src[1].split(",")[-1], "2000.0")
+        self.assertEqual(with_src[2].split(",")[-1], "")      # a source shorter than the output: empty cell
 
     def test_the_csv_is_saved_next_to_a_real_file(self):
         import queue
@@ -279,7 +279,8 @@ class BitrateOverTime(unittest.TestCase):
             q = queue.Queue()
             mf.save_bitrate_csv(dst, q)
             lines = (Path(tmp) / "clip_bitrate.csv").read_text(encoding="utf-8").splitlines()
-            self.assertEqual(lines[0], "start;end;kbps")
+            self.assertEqual(lines[0], "time,kbps")
+            self.assertEqual(len(lines[1].split(",")), 2)      # one time column and the bitrate
             self.assertEqual(len(lines), 4)                    # 0-1, 1-2 and the 10 s tail
             self.assertEqual(q.get_nowait()[0], "detail")
 

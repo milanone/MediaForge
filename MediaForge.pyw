@@ -2321,12 +2321,13 @@ def bucket_bitrates(packets: list, step: float, duration: float = None) -> list:
 
 
 def bitrate_csv_text(data: list, step: float, src_data: list = None) -> str:
-    """CSV text of the bitrate over time: `start;end;kbps[;source_kbps]`, times as h:mm:ss."""
-    lines = ["start;end;kbps" + (";source_kbps" if src_data else "")]
+    """CSV text of the bitrate over time, comma-separated: `time,kbps[,source_kbps]`. One time column, the middle of
+    each interval (where the chart draws the point), as h:mm:ss."""
+    lines = ["time,kbps" + (",source_kbps" if src_data else "")]
     for i, (t, k) in enumerate(data):
-        row = f"{format_clock(t)};{format_clock(t + step)};{k:.1f}"
+        row = f"{format_clock(t + step / 2)},{k:.1f}"
         if src_data:
-            row += ";" + (f"{src_data[i][1]:.1f}" if i < len(src_data) else "")
+            row += "," + (f"{src_data[i][1]:.1f}" if i < len(src_data) else "")
         lines.append(row)
     return "\n".join(lines) + "\n"
 
