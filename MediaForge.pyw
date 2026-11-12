@@ -361,15 +361,18 @@ def rileva_pixel_non_quadrati(video: dict) -> str:
 QSV_ENCODERS = ("hevc_qsv", "av1_qsv")
 # (lato lungo in px, CRF): 480p, 720p, 1080p, 4K; fuori dagli estremi il valore
 # resta fisso, in mezzo si interpola in scala logaritmica del lato.
-QSV_CRF_POINTS = ((854, 16), (1280, 18), (1920, 20), (3840, 22))
-QSV_CRF_DEFAULT = 20
+QSV_CRF_POINTS = ((854, 14), (1280, 16), (1920, 18), (3840, 20))
+QSV_CRF_DEFAULT = 18
+# Lowered by 2 on 2026-11-11 (it was 16/18/20/22): a 4K film kept at 4K (Dune Part Two) came out at 2700 kbps with
+# CRF 22, too little (the author wants 3500-4000 kbps); about -30% bitrate per +2 CRF puts CRF 20 in that range.
+# Only the 4K and the downscaled-4K points rest on a real result; 480p/720p/1080p follow the same shift, unmeasured.
 # A 4K-class source (long side >= QSV_SOURCE_4K_MIN) scaled down to a lower resolution gets this CRF instead of
-# the curve above (20 at 1080p). Measured 2026-11-10 on Loki S01E01, 3 clips of 60 s, 4K HDR -> 1080p, hevc_qsv:
+# the curve above (18 at 1080p). Measured 2026-11-10 on Loki S01E01, 3 clips of 60 s, 4K HDR -> 1080p, hevc_qsv:
 # detail kept (high-frequency energy vs the 1080p-scaled source, relative to CRF 8) fell to about a third at CRF
-# 14 and to a fifth at CRF 16 in the detailed scenes, and bitrate at CRF 22 was ~570 kbps. The author's choice is
-# 16 (saves space) or 14 (keeps detail); 16 is the default. Not measured: 4K source kept at 4K.
+# 14 and to a fifth at CRF 16 in the detailed scenes, and bitrate at CRF 22 was ~570 kbps. The author chose 14 after
+# a full encode (about 2100 kbps, detailed, still small; Predict bitrate with 20 clips of 0.2 min gave 2300 and 2400).
 QSV_SOURCE_4K_MIN = 3000
-QSV_CRF_DOWNSCALED_4K = 16
+QSV_CRF_DOWNSCALED_4K = 14
 # Preset QSV: i livelli reali sono 3 (misurato su N150 con hevc_qsv: da fast a
 # slow il file e' identico, faster=veryfast, slower=veryslow).
 QSV_PRESETS = (

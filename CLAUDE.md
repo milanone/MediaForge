@@ -58,22 +58,26 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
 - `crf_suggerito()` — default CRF from the selected file's resolution (higher resolution → higher
   CRF, same perceived quality) and a -4 offset for the AV1 family (more efficient than HEVC/H.264
   at the same CRF number). QSV encoders (`QSV_ENCODERS`) use a separate measured curve instead:
-  `QSV_CRF_POINTS` (480p=16, 720p=18, 1080p=20, 4K=22, log-interpolated; from VMAF runs on 4K
-  films with `hevc_qsv`, ported from MediaForge web; `av1_qsv` reuses it with +1, unmeasured).
+  `QSV_CRF_POINTS` (480p=14, 720p=16, 1080p=18, 4K=20, log-interpolated; `av1_qsv` reuses it with +1, unmeasured).
+  History: until 2026-11-10 it was 16/18/20/22 (from VMAF runs on 4K films with `hevc_qsv`, ported from MediaForge web);
+  lowered by 2 on 2026-11-11 because a 4K film kept at 4K (Dune Part Two) came out at 2700 kbps at CRF 22 and the author
+  wants 3500-4000 (about -30% bitrate per +2 CRF). Only the 4K and downscaled-4K points rest on a real result;
+  480p/720p/1080p follow the same shift, unmeasured (check them with Predict bitrate).
   Applied on file selection and on encoder change via
   `_aggiorna_quality_da_risoluzione()`, until the user edits the value by hand
   (`_quality_manuale`) — the "↺ Auto" button re-enables it
-- Default CRF for a 4K source scaled down (QSV): `crf_suggerito(..., source_side)` returns 16 when the source long side
-  is >= `QSV_SOURCE_4K_MIN` (3000) and the output is smaller (`QSV_CRF_DOWNSCALED_4K`); a 4K kept at 4K still gets 22
-  (the old curve, not re-measured). Why: Loki S01E01 (4K HDR, 23 Mbps), `hevc_qsv` to 1080p, three 60 s clips at
+- Default CRF for a 4K source scaled down (QSV): `crf_suggerito(..., source_side)` returns 14 when the source long side
+  is >= `QSV_SOURCE_4K_MIN` (3000) and the output is smaller (`QSV_CRF_DOWNSCALED_4K`); a 4K kept at 4K gets 20
+  (was 22, see above). Why: Loki S01E01 (4K HDR, 23 Mbps), `hevc_qsv` to 1080p, three 60 s clips at
   13:44, 20:00 and 32:51. Mean video bitrate over the clips: CRF 14 2594 kbps, 16 1625, 18 1081, 20 776, 22 573 (the
   user's own 4K -> 1080p encodes at CRF 22 came out at 600-700 kbps). Detail kept, measured as high-frequency
   (Laplacian) energy of the luma against the source scaled to 1080p, relative to CRF 8 (12.4 Mbps, which keeps all
   of it: the scaler is not the cause): in the two detailed frames 39%/33% at CRF 14, 23%/18% at 16, 17%/14% at 18,
   14%/10% at 22; in a plain frame 88/84/80/74%. The bitrate of the most detailed clip fell 86% from CRF 14 to 22
   against 71-72% for the others: high CRFs flatten the detailed scenes most. The metric cannot tell grain from real
-  detail, and it is 3 frames of one clip of one series: an indication, not a proof. The user's choice: 16 to save
-  space, 14 to keep detail; 16 is the default
+  detail, and it is 3 frames of one clip of one series: an indication, not a proof. The user chose 14 (was 16) after a
+  full Loki encode at CRF 14: about 2100 kbps, detailed and still small; Predict bitrate with 20 clips of 0.2 min gave 2300
+  and 2400 (stable, about 10-14% above the real size)
 - "Predict bitrate" (`predict_bitrate()`, `encode_sample()`, row under Rate control): encodes N clips (1-10, default
   3) of X minutes (default 1) of the selected file with the CURRENT settings, through `build_ffmpeg_cmd()` (same
   filter chain, encoder, CRF, GPU decode with the same fallback steps), video stream only, in a temp folder; then
@@ -217,7 +221,7 @@ enforces the "same" rows.
 | Real bitrate, declared bitrate, fix of a stale bitrate tag | yes | yes | same method; the web computes the real bitrate on every probe, the desktop only when nothing is declared or on request |
 | GPU decoder drops frames (error lines in the ffmpeg log) | stops the attempt, software fallback by itself | warning in the page: continue / stop / redo in software | different on purpose (software is very slow on gaia) |
 | GPU path | direct QSV first (`-hwaccel qsv`, as the web), then `d3d11va` + `hwmap`, then software | `-hwaccel qsv`, then software | same first choice; the extra d3d11va step exists only on Windows |
-| Default CRF for a 4K source scaled down (QSV) | 16 (`QSV_CRF_DOWNSCALED_4K`, via `crf_suggerito(source_side=)`) | 16 (`QSV_CRF_DOWNSCALED_4K` in `index.html`; the page now also feeds the OUTPUT size after the resolution cap, as the desktop does) | same (tested through node) |
+| Default CRF for a 4K source scaled down (QSV) | 14 (`QSV_CRF_DOWNSCALED_4K`, via `crf_suggerito(source_side=)`) | 14 (`QSV_CRF_DOWNSCALED_4K` in `index.html`; the page now also feeds the OUTPUT size after the resolution cap, as the desktop does) | same (tested through node) |
 | Predict bitrate (N clips of X min, random or typed times, mean/min/max, predicted size) | `predict_bitrate()` | `/api/predict`, `run_predict()` | same method (start-time and summary functions tested against each other); the web runs it as a hidden job and has no software fallback beyond software decoding |
 | Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
 | Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |

@@ -20,16 +20,16 @@ def video(codec="hevc", pix="yuv420p10le", w=3840, h=2160):
 
 class DefaultCrf(unittest.TestCase):
     def test_qsv_reference_points(self):
-        for (w, h), crf in {(854, 480): 16, (1280, 720): 18, (1920, 1080): 20, (3840, 2160): 22}.items():
+        for (w, h), crf in {(854, 480): 14, (1280, 720): 16, (1920, 1080): 18, (3840, 2160): 20}.items():
             self.assertEqual(mf.crf_suggerito(w, h, "hevc_qsv"), crf)
 
     def test_qsv_flat_outside_the_range_and_portrait(self):
-        self.assertEqual(mf.crf_suggerito(320, 240, "hevc_qsv"), 16)
-        self.assertEqual(mf.crf_suggerito(7680, 4320, "hevc_qsv"), 22)
-        self.assertEqual(mf.crf_suggerito(2160, 3840, "hevc_qsv"), 22)
+        self.assertEqual(mf.crf_suggerito(320, 240, "hevc_qsv"), 14)
+        self.assertEqual(mf.crf_suggerito(7680, 4320, "hevc_qsv"), 20)
+        self.assertEqual(mf.crf_suggerito(2160, 3840, "hevc_qsv"), 20)
 
     def test_av1_family_gets_plus_one(self):
-        self.assertEqual(mf.crf_suggerito(1920, 1080, "av1_qsv"), 21)
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "av1_qsv"), 19)
 
     def test_other_encoders_keep_the_old_curve(self):
         self.assertEqual(mf.crf_suggerito(1920, 1080, "libx265"), 25)
@@ -161,15 +161,15 @@ class GpuDecodeSafety(unittest.TestCase):
 
 
 class DefaultCrfForDownscaled4K(unittest.TestCase):
-    def test_4k_source_scaled_down_gets_16_with_qsv(self):
-        self.assertEqual(mf.crf_suggerito(1920, 1080, "hevc_qsv", source_side=3840), 16)
-        self.assertEqual(mf.crf_suggerito(1280, 720, "hevc_qsv", source_side=3840), 16)
-        self.assertEqual(mf.crf_suggerito(1920, 1080, "av1_qsv", source_side=3840), 17)
+    def test_4k_source_scaled_down_gets_14_with_qsv(self):
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "hevc_qsv", source_side=3840), 14)
+        self.assertEqual(mf.crf_suggerito(1280, 720, "hevc_qsv", source_side=3840), 14)
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "av1_qsv", source_side=3840), 15)
 
     def test_4k_source_kept_at_4k_and_other_sources_keep_the_curve(self):
-        self.assertEqual(mf.crf_suggerito(3840, 2160, "hevc_qsv", source_side=3840), 22)
-        self.assertEqual(mf.crf_suggerito(1920, 1080, "hevc_qsv", source_side=1920), 20)
-        self.assertEqual(mf.crf_suggerito(1280, 720, "hevc_qsv", source_side=2560), 18)
+        self.assertEqual(mf.crf_suggerito(3840, 2160, "hevc_qsv", source_side=3840), 20)
+        self.assertEqual(mf.crf_suggerito(1920, 1080, "hevc_qsv", source_side=1920), 18)
+        self.assertEqual(mf.crf_suggerito(1280, 720, "hevc_qsv", source_side=2560), 16)
 
     def test_other_encoders_are_not_affected(self):
         self.assertEqual(mf.crf_suggerito(1920, 1080, "libx265", source_side=3840), 25)
