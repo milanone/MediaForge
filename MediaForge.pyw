@@ -2341,7 +2341,7 @@ def save_bitrate_csv(dst: Path, log_q: queue.Queue, step: float = 60.0):
             return
         csv_path = dst.with_name(dst.stem + "_bitrate.csv")
         csv_path.write_text(bitrate_csv_text(data, step), encoding="utf-8", newline="")
-        log_q.put(("detail", f"  bitrate values saved: {csv_path.name}"))
+        log_q.put(("detail", f"  bitrate values saved: {csv_path}"))
     except Exception as e:
         log_q.put(("detail", f"  bitrate CSV not saved: {e}"))
 
