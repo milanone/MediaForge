@@ -236,17 +236,32 @@ def contenitore_predefinito(path) -> str:
     return "mp4" if Path(path).suffix.lower().lstrip(".") in ("mp4", "m4v", "mov") else "mkv"
 
 
+def rapporto_fps_regolare(dichiarati: float, reali: float) -> bool:
+    """True when the declared rate is a whole multiple (2x, 3x...) of the real one: the repeats then come in regular
+    runs (A A B B), and dropping them with the fps filter keeps every real frame (tried with 7 different phases of
+    the pairs, 50 -> 25). With any other ratio (30 for 24: one repeat every 5 frames, in a pattern that changes from
+    file to file) fps= can take a repeat and skip a good frame (tried: up to 25% of the real frames lost; decimate
+    still lost up to 8%), while keeping the repeats costs about 8% in size: so the rate is left alone.
+    Same rule as MediaForge web (fps_ratio_regular in app.py)."""
+    if not reali:
+        return False
+    r = dichiarati / reali
+    return round(r) >= 2 and abs(r - round(r)) <= 0.03
+
+
 def classifica_fps(dichiarati: float, contenuto, tempi) -> dict:
     """Verdict on the frame rate from the two measurements (fps_contenuto, analizza_fps), the same rules as the
-    "Check original FPS" dialog (_fps_misurati): action "limit" = the content has fewer real frames than declared
-    (duplicates, e.g. 24 fps stored as 30), "vfr" = no duplicates but a variable rate, "ok" = the content matches.
-    Also gives the standard rate to set, the real rate measured and the share of repeated frames."""
+    "Check original FPS" dialog (_fps_misurati): action "limit" = the content has fewer real frames than declared in
+    a regular ratio (60 for 30, 50 for 25: safe to drop the repeats), "keep" = repeats in any other ratio (24 stored
+    as 30: dropping them can discard good frames, see rapporto_fps_regolare), "vfr" = no duplicates but a variable
+    rate, "ok" = the content matches. Also gives the standard rate, the real rate measured and the share of repeated
+    frames."""
     massimo, per_spezzone = contenuto
     std, scarto = fps_standard_vicino(massimo, dichiarati)
     std_val = fps_da_frazione(std)
     vfr = bool(tempi and tempi["vfr"])
     if scarto <= FPS_TOLLERANZA_STANDARD and dichiarati >= std_val * (1 + FPS_SCARTO_MINIMO):
-        azione = "limit"
+        azione = "limit" if rapporto_fps_regolare(dichiarati, std_val) else "keep"
     elif vfr and tempi:
         azione, std = "vfr", tempi["standard"]
     else:
@@ -4434,8 +4449,9 @@ class App(_BaseTk):
                                  command=lambda: self._verifica_fps_originali(path))
             btn_fps.pack(side="left", padx=(0, 12))
             Tooltip(btn_fps, "Counts the real (non-duplicated) frames on 5 short clips and compares\n"
-                             "them with the declared rate: e.g. a 24 fps film stored as 30 fps\n"
-                             "with repeated frames. Then sets the FPS limit consistently.")
+                             "them with the declared rate: e.g. a 60 fps file that is really 30.\n"
+                             "Repeats in a whole ratio (2x) can be dropped safely and the FPS limit is\n"
+                             "proposed; at other ratios (24 stored as 30) the rate is left alone.")
         if video is not None:
             btn_chart = ttk.Button(btn_frame, text="📈 Bitrate chart",
                                    command=lambda: BitrateChartWindow(self, path))
@@ -4538,6 +4554,11 @@ class App(_BaseTk):
                 f"⚠ The file declares {dichiarati:.3f} fps but the content is about {r['std_val']:.3f} fps "
                 f"({r['duplicati_pct']}% repeated frames): encoding at the declared rate keeps the duplicates.",
                 "#cc6600", "limit", r["std"])
+        elif r["azione"] == "keep":
+            self._mostra_fps_avviso(
+                f"ℹ The file declares {dichiarati:.3f} fps but the content is about {r['std_val']:.3f} fps "
+                f"({r['duplicati_pct']}% repeated frames). Left as it is: removing the repeats at this ratio can "
+                "discard good frames, keeping them costs about 8% in size.", "#555555")
         elif r["azione"] == "vfr":
             self._mostra_fps_avviso(
                 f"⚠ Variable frame rate ({tempi['irregolari_pct']:.0f}% irregular intervals), no repeated frames. "
@@ -4607,6 +4628,12 @@ class App(_BaseTk):
                           "irregular intervals)" if vfr else "constant frame rate") + "\n")
         riepilogo += "\n"
         proposta = scarto <= FPS_TOLLERANZA_STANDARD and dichiarati >= std_val * (1 + FPS_SCARTO_MINIMO)
+        if proposta and not rapporto_fps_regolare(dichiarati, std_val):
+            messagebox.showinfo("Check FPS", riepilogo + f"The content looks like {std_val:.3f} fps ({std}) with "
+                                "repeated frames, but at this ratio removing them can discard good frames (the repeats "
+                                "are not in regular runs), while keeping them costs about 8% in size. The rate is left "
+                                "as it is.")
+            return
         if proposta:
             domanda = (riepilogo + f"The content looks like {std_val:.3f} fps ({std}) with duplicated "
                        f"frames. Set FPS limit to {std}?")

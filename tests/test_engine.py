@@ -295,13 +295,52 @@ class DefaultContainer(unittest.TestCase):
 class FpsVerdict(unittest.TestCase):
     """classifica_fps: what the automatic check on selection tells (same rules as the "Check original FPS" dialog)."""
 
-    def test_duplicated_frames_are_a_warning_with_the_standard_rate(self):
-        r = mf.classifica_fps(30.0, (24.0, [23.8, 24.0, 23.9, 24.0, 23.7]), None)
-        self.assertEqual((r["azione"], r["std"], r["duplicati_pct"]), ("limit", "24/1", 20))
+    def test_regular_ratios_can_be_dropped(self):
+        for dichiarati, reali, std in ((60.0, 30.0, "30/1"), (59.94, 29.97, "30000/1001"), (50.0, 25.0, "25/1")):
+            r = mf.classifica_fps(dichiarati, (reali, [reali]), None)
+            self.assertEqual((r["azione"], r["std"], r["duplicati_pct"]), ("limit", std, 50), (dichiarati, reali))
 
-    def test_ntsc_family_is_kept(self):
+    def test_24_stored_as_30_is_left_alone(self):
+        """One repeat every 5 frames: fps= can skip a good frame (tried: up to 25% lost), so only information."""
+        r = mf.classifica_fps(30.0, (24.0, [23.8, 24.0, 23.9, 24.0, 23.7]), None)
+        self.assertEqual((r["azione"], r["std"], r["duplicati_pct"]), ("keep", "24/1", 20))
         r = mf.classifica_fps(29.97, (23.9, [23.9]), None)
-        self.assertEqual((r["azione"], r["std"]), ("limit", "24000/1001"))
+        self.assertEqual((r["azione"], r["std"]), ("keep", "24000/1001"))
+
+    def test_halving_exact_pairs_keeps_every_real_frame(self):
+        """Why 2:1 is the safe ratio: 50 fps made of repeated pairs of a 25 fps clip, brought back with fps=25 (the filter
+        the FPS limit applies), whatever the phase of the pairs: no real frame lost, none repeated (checked on the
+        picture of every frame)."""
+        import shutil
+        import subprocess
+        import tempfile
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not available")
+
+        def run(*a):
+            subprocess.run(["ffmpeg", "-y", "-v", "error", *map(str, a)], check=True)
+
+        def hashes(p):
+            r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(p), "-map", "0:v:0", "-f", "framemd5", "-"],
+                               capture_output=True, text=True, check=True)
+            return [ln.split(",")[-1].strip() for ln in r.stdout.splitlines() if ln and not ln.startswith("#")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src, v50, out = (Path(tmp) / n for n in ("s.mkv", "v50.mkv", "o.mkv"))
+            run("-f", "lavfi", "-i", "testsrc2=size=160x120:rate=25", "-t", "8", "-c:v", "ffv1", src)
+            real = hashes(src)
+            for vf in ("fps=50", "fps=50:round=down", "setpts=PTS+0.01/TB,fps=50", "setpts=PTS+0.02/TB,fps=50"):
+                run("-i", src, "-vf", vf, "-c:v", "ffv1", v50)
+                run("-i", v50, "-vf", "fps=25", "-c:v", "ffv1", out)
+                h = hashes(out)
+                self.assertEqual(set(real) - set(h), set(), vf)
+                self.assertEqual(sum(1 for a, b in zip(h, h[1:]) if a == b), 0, vf)
+
+    def test_the_ratio_rule(self):
+        for d, real, want in ((60, 30, True), (50, 25, True), (59.94, 29.97, True), (120, 30, True), (90, 30, True),
+                              (30, 24, False), (29.97, 23.976, False), (25, 24, False), (60, 24, False), (30, 30, False),
+                              (30, 0, False)):
+            self.assertEqual(mf.rapporto_fps_regolare(d, real), want, (d, real))
 
     def test_a_matching_content_is_ok(self):
         r = mf.classifica_fps(25.0, (24.9, [24.9, 24.8]), {"vfr": False, "standard": "25/1", "irregolari_pct": 0.0})
@@ -328,7 +367,7 @@ class FpsVerdict(unittest.TestCase):
             dichiarati = mf.fps_da_frazione(video["avg_frame_rate"])
             r = mf.classifica_fps(dichiarati, mf.fps_contenuto(src, 60.0), mf.analizza_fps(src, video))
             self.assertAlmostEqual(dichiarati, 30.0, delta=0.1)
-            self.assertEqual((r["azione"], r["std"]), ("limit", "24/1"))
+            self.assertEqual((r["azione"], r["std"]), ("keep", "24/1"))       # found, and left alone
 
 
 class LiveCharts(unittest.TestCase):
