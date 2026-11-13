@@ -229,6 +229,32 @@ def fps_standard_vicino(fps: float, dichiarati: float = 0.0):
     return migliore(FPS_STANDARD)
 
 
+def contenitore_predefinito(path) -> str:
+    """Default output container: the same as the source (mkv -> mkv, mp4/m4v/mov -> mp4). Anything else (avi, ts,
+    webm...) -> mkv, which takes every stream: HEVC/AV1 do not go properly into AVI. Same rule as MediaForge web
+    (containerForSource in index.html)."""
+    return "mp4" if Path(path).suffix.lower().lstrip(".") in ("mp4", "m4v", "mov") else "mkv"
+
+
+def classifica_fps(dichiarati: float, contenuto, tempi) -> dict:
+    """Verdict on the frame rate from the two measurements (fps_contenuto, analizza_fps), the same rules as the
+    "Check original FPS" dialog (_fps_misurati): action "limit" = the content has fewer real frames than declared
+    (duplicates, e.g. 24 fps stored as 30), "vfr" = no duplicates but a variable rate, "ok" = the content matches.
+    Also gives the standard rate to set, the real rate measured and the share of repeated frames."""
+    massimo, per_spezzone = contenuto
+    std, scarto = fps_standard_vicino(massimo, dichiarati)
+    std_val = fps_da_frazione(std)
+    vfr = bool(tempi and tempi["vfr"])
+    if scarto <= FPS_TOLLERANZA_STANDARD and dichiarati >= std_val * (1 + FPS_SCARTO_MINIMO):
+        azione = "limit"
+    elif vfr and tempi:
+        azione, std = "vfr", tempi["standard"]
+    else:
+        azione = "ok"
+    return {"azione": azione, "std": std, "std_val": fps_da_frazione(std), "massimo": massimo,
+            "per_spezzone": per_spezzone, "duplicati_pct": max(0, round((1 - massimo / dichiarati) * 100))}
+
+
 def video_ha_bitrate_noto(video: dict) -> bool:
     """True se lo stream video ha già un bitrate leggibile SENZA ricalcolarlo
     (campo bit_rate genuino, o tag BPS/BPS-eng): usato da _mostra_stream/
@@ -3046,7 +3072,7 @@ class LiveChartWindow(tk.Toplevel):
     elapsed since the file started (a dashed line marks a new pass or retry)."""
     CHARTS = (
         ("fps", "Encoding speed (frames per second)", "fps", 0, (("fps", "#1f6fd1", 2),)),
-        ("speed", "Speed against real time (x)", "x", 2, (("speed", "#1f6fd1", 2),)),
+        ("speed", "Speed against real time (1× = real time)", "x", 2, (("speed", "#1f6fd1", 2),)),
         ("bitrate", "Video bitrate (kbps)", "kbps", 0, (("inst_kbps", "#1f6fd1", 2), ("avg_kbps", "#999999", 1))),
     )
 
@@ -3749,6 +3775,19 @@ class App(_BaseTk):
             "<Configure>", lambda e: self._lbl_sar_avviso.configure(wraplength=max(200, e.width)))
         # Non lo pack() subito: appare/scompare dinamicamente
 
+        # Riga 2e: real frame rate of the selected file, measured by itself when the file is selected (see
+        # _fps_auto_check): a warning with a button when the content has fewer real frames than declared, so
+        # it is not forgotten to press "Check original FPS". Appears/disappears like the SAR warning.
+        self._frm_fps_avviso = ttk.Frame(self._frm_video_specific)
+        self._lbl_fps_avviso = ttk.Label(self._frm_fps_avviso)
+        self._btn_fps_avviso = ttk.Button(self._frm_fps_avviso)
+        self._btn_fps_avviso.pack(side="right", padx=(8, 0))
+        self._lbl_fps_avviso.pack(side="left", fill="x", expand=True)
+        self._lbl_fps_avviso.bind(
+            "<Configure>", lambda e: self._lbl_fps_avviso.configure(wraplength=max(200, e.width)))
+        self._fps_auto_token = 0     # a result for a file that is no longer selected is dropped
+        self._fps_auto_cache = {}    # str(path) -> (fps_contenuto, analizza_fps): measured once per file
+
         # Riga 3: audio (sempre visibile, anche in modalità "Solo audio")
         r3 = ttk.Frame(frm_opt); r3.pack(fill="x", padx=5, pady=3)
         self._frm_audio_row = r3  # ancora per ripristinare l'ordine dei pannelli
@@ -4344,6 +4383,7 @@ class App(_BaseTk):
 
         data    = self._ottieni_probe(path)
         self._cached_probe = data
+        self._var_ext.set(contenitore_predefinito(path))   # the container of the source, changeable before Avvia
         self._mostra_metadati(data)
         dur_sec = 0.0
         try:
@@ -4369,6 +4409,7 @@ class App(_BaseTk):
         else:
             self._frm_sar_avviso.pack_forget()
         self._aggiorna_quality_da_risoluzione(video)
+        self._fps_auto_check(path, video, dur_sec)
 
         if not streams:
             return
@@ -4425,6 +4466,86 @@ class App(_BaseTk):
         for var in self._stream_vars:
             var.set(valore)
         self._aggiorna_anteprima()
+
+    def _mostra_fps_avviso(self, testo: str, colore: str, azione=None, frazione=None):
+        """Real-frame-rate line under the video options: grey for information, orange for a warning, with a button
+        that sets the FPS limit (azione "limit"/"vfr") when there is something to set."""
+        self._lbl_fps_avviso.configure(text=testo, foreground=colore)
+        if azione:
+            etichetta = (f"Set FPS limit to {frazione}" if azione == "limit" else f"Set constant {frazione} fps")
+            self._btn_fps_avviso.configure(text=etichetta, command=lambda: self._applica_fps(frazione))
+            self._btn_fps_avviso.pack(side="right", padx=(8, 0))
+        else:
+            self._btn_fps_avviso.pack_forget()
+        self._frm_fps_avviso.pack(fill="x", padx=5, pady=(0, 3))
+
+    def _applica_fps(self, frazione: str):
+        """Same effect as accepting the "Check original FPS" dialog: limit the FPS to this exact fraction."""
+        self._var_limit_fps.set(True)
+        self._var_fps.set(max(1, round(fps_da_frazione(frazione))))
+        self._fps_exact = frazione  # dopo il set: il trace non deve azzerarla
+        self._toggle_fps_keep_exact()
+        self._aggiorna_anteprima()
+        self._mostra_fps_avviso(f"FPS limit set to {frazione} fps.", "gray")
+
+    def _fps_auto_check(self, path: Path, video: dict, durata: float):
+        """Measures the real frame rate of the file that has just been selected (same measurement as the "Check
+        original FPS" button: fps_contenuto on 5 clips, analizza_fps on the timestamps) in a thread, and shows the
+        verdict under the video options WITHOUT changing any setting: the user decides with the button. Skipped
+        while an operation runs (it would slow it down) and without a declared rate. The result is kept per file."""
+        self._fps_auto_token += 1
+        token = self._fps_auto_token
+        self._frm_fps_avviso.pack_forget()
+        dichiarati = (fps_da_frazione(video.get("avg_frame_rate")) or fps_da_frazione(video.get("r_frame_rate"))) \
+            if video else 0.0
+        if not video or not dichiarati or durata <= 0 or self._active_op:
+            return
+        key = str(path)
+        if key in self._fps_auto_cache:
+            self._fps_auto_mostra(token, dichiarati, *self._fps_auto_cache[key])
+            return
+        self._mostra_fps_avviso("Checking the real frame rate of the file…", "gray")
+        esito_q = queue.Queue()
+
+        def misura():
+            try:
+                esito_q.put((fps_contenuto(path, durata), analizza_fps(path, video)))
+            except Exception:
+                esito_q.put((None, None))
+
+        def attendi():
+            try:
+                esito = esito_q.get_nowait()
+            except queue.Empty:
+                if token == self._fps_auto_token:     # nobody waits for it any more otherwise
+                    self.after(200, attendi)
+                return
+            self._fps_auto_cache[key] = esito
+            self._fps_auto_mostra(token, dichiarati, *esito)
+
+        threading.Thread(target=misura, daemon=True).start()
+        self.after(200, attendi)
+
+    def _fps_auto_mostra(self, token: int, dichiarati: float, contenuto, tempi):
+        if token != self._fps_auto_token:
+            return
+        if contenuto is None:
+            self._mostra_fps_avviso("Real frame rate: could not be measured.", "gray")
+            return
+        r = classifica_fps(dichiarati, contenuto, tempi)
+        if r["azione"] == "limit":
+            self._mostra_fps_avviso(
+                f"⚠ The file declares {dichiarati:.3f} fps but the content is about {r['std_val']:.3f} fps "
+                f"({r['duplicati_pct']}% repeated frames): encoding at the declared rate keeps the duplicates.",
+                "#cc6600", "limit", r["std"])
+        elif r["azione"] == "vfr":
+            self._mostra_fps_avviso(
+                f"⚠ Variable frame rate ({tempi['irregolari_pct']:.0f}% irregular intervals), no repeated frames. "
+                "A constant rate avoids sync problems in some players.", "#cc6600", "vfr", r["std"])
+        else:
+            self._mostra_fps_avviso(
+                f"Real frame rate checked: {r['massimo']:.2f} fps, the content matches the declared "
+                f"{dichiarati:.3f} fps.", "gray")
 
     def _verifica_fps_originali(self, path: Path):
         """Conta i fotogrammi VERI del contenuto (fps_contenuto, mpdecimate su 5
@@ -4793,6 +4914,8 @@ class App(_BaseTk):
         self._frm_trim.pack_forget()
         self._frm_streams.pack_forget()
         self._frm_sar_avviso.pack_forget()
+        self._fps_auto_token += 1
+        self._frm_fps_avviso.pack_forget()
         self._stream_vars.clear()
         self._var_ss_on = None
         self._var_t_on  = None

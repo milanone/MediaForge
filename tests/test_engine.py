@@ -285,6 +285,52 @@ class BitrateOverTime(unittest.TestCase):
             self.assertEqual(q.get_nowait()[0], "detail")
 
 
+class DefaultContainer(unittest.TestCase):
+    def test_same_as_the_source_when_possible(self):
+        for name, want in {"a.mkv": "mkv", "a.MKV": "mkv", "a.mp4": "mp4", "a.m4v": "mp4", "a.mov": "mp4",
+                           "a.avi": "mkv", "a.ts": "mkv", "a.webm": "mkv", "noext": "mkv"}.items():
+            self.assertEqual(mf.contenitore_predefinito(Path("C:/x") / name), want, name)
+
+
+class FpsVerdict(unittest.TestCase):
+    """classifica_fps: what the automatic check on selection tells (same rules as the "Check original FPS" dialog)."""
+
+    def test_duplicated_frames_are_a_warning_with_the_standard_rate(self):
+        r = mf.classifica_fps(30.0, (24.0, [23.8, 24.0, 23.9, 24.0, 23.7]), None)
+        self.assertEqual((r["azione"], r["std"], r["duplicati_pct"]), ("limit", "24/1", 20))
+
+    def test_ntsc_family_is_kept(self):
+        r = mf.classifica_fps(29.97, (23.9, [23.9]), None)
+        self.assertEqual((r["azione"], r["std"]), ("limit", "24000/1001"))
+
+    def test_a_matching_content_is_ok(self):
+        r = mf.classifica_fps(25.0, (24.9, [24.9, 24.8]), {"vfr": False, "standard": "25/1", "irregolari_pct": 0.0})
+        self.assertEqual(r["azione"], "ok")
+        self.assertEqual(r["duplicati_pct"], 0)
+
+    def test_variable_rate_without_duplicates(self):
+        r = mf.classifica_fps(30.0, (29.9, [29.9]), {"vfr": True, "standard": "30/1", "irregolari_pct": 12.0})
+        self.assertEqual((r["azione"], r["std"]), ("vfr", "30/1"))
+
+    def test_the_automatic_check_on_a_real_file_with_duplicated_frames(self):
+        """A 24 fps clip stored at 30 fps (frames repeated): both measurements agree with the verdict."""
+        import shutil
+        import subprocess
+        import tempfile
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "dup.mkv"
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24",
+                            "-t", "60", "-vf", "fps=30", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+            data = mf.ffprobe_json(src)
+            video = next(s for s in data["streams"] if s["codec_type"] == "video")
+            dichiarati = mf.fps_da_frazione(video["avg_frame_rate"])
+            r = mf.classifica_fps(dichiarati, mf.fps_contenuto(src, 60.0), mf.analizza_fps(src, video))
+            self.assertAlmostEqual(dichiarati, 30.0, delta=0.1)
+            self.assertEqual((r["azione"], r["std"]), ("limit", "24/1"))
+
+
 class LiveCharts(unittest.TestCase):
     LINE = "frame=  240 fps= 48 q=-1.0 size=    1024KiB time=00:00:10.00 bitrate= 838.9kbits/s speed=1.98x"
 

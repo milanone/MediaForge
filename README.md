@@ -58,6 +58,11 @@ control the playback side, not a safe default otherwise.
   specific file, the app retries it automatically with software decoding
 - "Stop and keep file" closes the current encode cleanly and keeps the playable partial file
   (the regular "Interrompi" button discards it)
+- The same frame-rate measurement runs by itself when a single file is selected, in a thread: if the content has fewer real
+  frames than declared (e.g. 24 fps stored as 30) or a variable rate, a warning with a button appears under the video options;
+  no setting is changed by itself
+- The default output format is the source's own (mkv -> mkv, mp4/m4v/mov -> mp4; anything else, AVI included, -> mkv), changeable
+  before Avvia
 - "Check original FPS": counts the real (non-duplicated) frames on 5 short clips and compares them 
   with the declared rate (e.g. a 24 fps film stored as 30 fps); proposes the matching FPS limit,
   and also flags variable frame rate

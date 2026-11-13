@@ -160,6 +160,13 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   hands the result to the GUI through a queue (`self.after` from a thread is not safe). Takes
   ~10 s on a 60 s file. Tested on synthetic files only (24->30, 25->50, 29.97->59.94 duplicates,
   true 30, VFR), not on real footage
+- Automatic FPS check (`_fps_auto_check()`, called from `_mostra_stream()`): the same two measurements as the button run in a thread
+  as soon as a single file is selected (skipped while an operation runs, without a declared rate, or for a batch); `classifica_fps()`
+  gives the verdict (`limit` = repeated frames, `vfr`, `ok`), `_mostra_fps_avviso()` shows it under the video options (orange with a
+  "Set FPS limit to X" button, or grey), `_applica_fps()` does what accepting the dialog does. A stale result (another file selected)
+  is dropped by `_fps_auto_token`; results are kept per file in `_fps_auto_cache`. Tried in the real app on a 24 fps clip stored at 30
+  (warning + button set the limit to 24/1). `_mostra_stream()` also sets the output format to the source's own
+  (`contenitore_predefinito()`; AVI sources get mkv: HEVC/AV1 do not go into AVI)
 - `converti_file()` / `worker()` — runs conversion in a background thread, streaming log lines
   back to the UI via a `queue.Queue`
 - `esegui_ffmpeg_con_watchdog()` — runs one ffmpeg attempt and detects a STALL (`time=` in the
@@ -234,6 +241,8 @@ enforces the "same" rows.
 | Default CRF for a 4K source scaled down (QSV) | 14 (`QSV_CRF_DOWNSCALED_4K`, via `crf_suggerito(source_side=)`) | 14 (`QSV_CRF_DOWNSCALED_4K` in `index.html`; the page now also feeds the OUTPUT size after the resolution cap, as the desktop does) | same (tested through node) |
 | Live charts while encoding (fps, speed, video bitrate instantaneous + average, audio subtracted) | `LiveStats`, `parse_progress_line()`, `audio_output_kbps()`, `LiveChartWindow` (a separate window) | `record_progress()`, `parse_progress_line()`, `audio_output_kbps()`, `drawChart()` (inside the page) | same numbers and rules (tested against each other); the desktop shows them in a window, the web in the page |
 | Bitrate over time of the finished file (exact, per interval, CSV) | `BitrateChartWindow`, `read_video_packets()`, `bucket_bitrates()`, autosave `<output>_bitrate.csv` ("Bitrate CSV" checkbox, h:mm:ss times) | `/api/bitrate_chart`, same two functions, autosave `<output>_bitrate.csv` (seconds) | same method; CSV time columns differ (h:mm:ss vs seconds). Chart of any file with no job: desktop button "Bitrate chart", web button "Bitrate nel tempo del file" (`/api/file_bitrate_chart`); both say where the CSV was saved |
+| Real FPS checked by itself when a file is selected (warning + button, nothing changed automatically; cached per file) | `_fps_auto_check()`, `classifica_fps()`, `fps_contenuto()`, `analizza_fps()` (thread) | `autoCheckFps()`, `/api/detect_fps` (cache `_fps_cache`) | same measurement, 5 clips of 8 s with mpdecimate; verdicts agree (`test_fps_auto.py`); the desktop also flags a variable rate |
+| Default output container = the source's (mkv -> mkv, mp4/m4v/mov -> mp4, else mkv) | `contenitore_predefinito()` | `containerForSource()` | same (tested through node) |
 | Predict bitrate (N clips of X min, random or typed times, mean/min/max, predicted size) | `predict_bitrate()` | `/api/predict`, `run_predict()` | same method (start-time and summary functions tested against each other); the web runs it as a hidden job and has no software fallback beyond software decoding |
 | Encoders | QSV, AMF, NVENC, VideoToolbox, x265, SVT-AV1 | QSV, x265 | different on purpose |
 | Mux, Chapters, batch folder / library, upload, background jobs | desktop only / web only | | different on purpose |
