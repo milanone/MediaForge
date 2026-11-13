@@ -3818,9 +3818,12 @@ class App(_BaseTk):
         self._frm_subs = ttk.Frame(frm_opt); self._frm_subs.pack(fill="x", padx=5, pady=3)
         ttk.Label(self._frm_subs, text="Sottotitoli:").pack(side="left")
         self._var_subs = tk.StringVar(value="copy")
+        self._radio_subs = []   # disabled when the selected file has no subtitle track (see _imposta_stato_subs)
         for val, lbl in [("copy","Copia"), ("srt","Converti in SRT"), ("no","Escludi"),
                           ("mux","Muxa a fine codifica")]:
-            ttk.Radiobutton(self._frm_subs, text=lbl, variable=self._var_subs, value=val).pack(side="left", padx=6)
+            rb = ttk.Radiobutton(self._frm_subs, text=lbl, variable=self._var_subs, value=val)
+            rb.pack(side="left", padx=6)
+            self._radio_subs.append(rb)
         Tooltip(self._frm_subs,
                 "\"Muxa a fine codifica\": i sottotitoli vengono esclusi dalla "
                 "codifica principale e aggiunti dopo con un remux separato "
@@ -4284,7 +4287,17 @@ class App(_BaseTk):
         # copiati inalterati: niente selezione stream né taglio, per non
         # rischiare di modificare il file.
         if len(sel) == 1 and self._var_mode.get() not in ("fixtag", "fixbitrate"):
-            self._mostra_stream(self._all_files[sel[0]])
+            # reading a film (ffprobe, the real bitrate) takes seconds on a network drive and blocks the window:
+            # say so first, and paint it before the wait starts
+            precedente = self._lbl_stato.cget("text")
+            self.config(cursor="watch")
+            self._lbl_stato.config(text="Reading the file…")
+            self.update_idletasks()
+            try:
+                self._mostra_stream(self._all_files[sel[0]])
+            finally:
+                self.config(cursor="")
+                self._lbl_stato.config(text=precedente)
         else:
             self._nascondi_stream()
         self._aggiorna_anteprima()
@@ -4416,6 +4429,9 @@ class App(_BaseTk):
         # Verifica bitrate reale", non un ricalcolo automatico ad ogni file).
         bitrate_video = None
         if video and not video_ha_bitrate_noto(video):
+            if str(path) not in self._bitrate_video_cache:
+                self._lbl_stato.config(text="Checking the real bitrate…")
+                self.update_idletasks()
             bitrate_video = self._ottieni_bitrate_video(path, dur_sec)
         avviso_sar = rileva_pixel_non_quadrati(video)
         if avviso_sar:
@@ -4424,6 +4440,7 @@ class App(_BaseTk):
         else:
             self._frm_sar_avviso.pack_forget()
         self._aggiorna_quality_da_risoluzione(video)
+        self._imposta_stato_subs(any(s.get("codec_type") == "subtitle" for s in streams))
         self._fps_auto_check(path, video, dur_sec)
 
         if not streams:
@@ -4482,6 +4499,12 @@ class App(_BaseTk):
         for var in self._stream_vars:
             var.set(valore)
         self._aggiorna_anteprima()
+
+    def _imposta_stato_subs(self, ci_sono_sottotitoli: bool):
+        """The subtitle choice (copy / SRT / exclude / mux afterwards) is meaningless for a file without subtitle
+        tracks: its buttons are greyed out then, and usable again for a file that has some (or for a batch)."""
+        for rb in self._radio_subs:
+            rb.configure(state="normal" if ci_sono_sottotitoli else "disabled")
 
     def _mostra_fps_avviso(self, testo: str, colore: str, azione=None, frazione=None):
         """Real-frame-rate line under the video options: grey for information, orange for a warning, with a button
@@ -4941,6 +4964,7 @@ class App(_BaseTk):
         self._frm_trim.pack_forget()
         self._frm_streams.pack_forget()
         self._frm_sar_avviso.pack_forget()
+        self._imposta_stato_subs(True)      # no single file shown (batch): the tracks are not known, leave it usable
         self._fps_auto_token += 1
         self._frm_fps_avviso.pack_forget()
         self._stream_vars.clear()
