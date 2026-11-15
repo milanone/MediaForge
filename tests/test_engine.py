@@ -422,11 +422,25 @@ class LiveCharts(unittest.TestCase):
         self.assertEqual(live.history[-1]["pass"], 2)
         self.assertIsNone(live.history[-1]["inst_kbps"])
 
-    def test_the_first_sample_of_every_pass_is_not_drawn(self):
-        s = [{"pass": 1, "t": 0}, {"pass": 1, "t": 10}, {"pass": 1, "t": 20}, {"pass": 2, "t": 30}, {"pass": 2, "t": 40}]
-        self.assertEqual([p["t"] for p in mf.live_chart_points(s)], [10, 20, 40])
+    def test_the_charts_draw_the_latest_pass_without_its_first_sample(self):
+        s = [{"pass": 1, "t": 0, "time_s": 5.0}, {"pass": 1, "t": 10, "time_s": 50.0},
+             {"pass": 1, "t": 20, "time_s": 95.0}, {"pass": 2, "t": 30, "time_s": 4.0},
+             {"pass": 2, "t": 40, "time_s": 48.0}, {"pass": 2, "t": 50, "time_s": 90.0}]
+        self.assertEqual([p["t"] for p in mf.live_chart_points(s)], [40, 50])
+        self.assertEqual([p["t"] for p in mf.live_chart_points(s[:3])], [10, 20])
         self.assertEqual(mf.live_chart_points(s[:1]), [])
-        self.assertEqual(len(s), 5)                       # the samples themselves are untouched
+        self.assertEqual(mf.live_chart_points([]), [])
+        self.assertEqual(len(s), 6)                       # the samples themselves are untouched
+
+    def test_the_x_axis_is_the_position_in_the_film_not_the_elapsed_time(self):
+        """A film of 1:23:05 encoded in 17 minutes: the samples carry both; the charts use the film time."""
+        s = [{"pass": 1, "t": 30.0 * i, "time_s": 4985.0 * i / 34, "fps": 24.0} for i in range(1, 35)]
+        pts = mf.live_chart_points(s)
+        self.assertAlmostEqual(pts[-1]["time_s"], 4985.0)            # 1:23:05
+        self.assertLess(pts[-1]["t"], 1100)                           # the wall clock: about 17 minutes
+        # a sample without a film time (ffmpeg printed time=N/A) is not drawn
+        self.assertEqual(len(mf.live_chart_points([{"pass": 1, "time_s": 1.0}, {"pass": 1, "time_s": None},
+                                                   {"pass": 1, "time_s": 3.0}])), 1)
 
     def test_unknown_audio_subtracts_nothing(self):
         import queue

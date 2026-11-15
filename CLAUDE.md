@@ -78,8 +78,9 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   detail, and it is 3 frames of one clip of one series: an indication, not a proof. The user chose 14 (was 16) after a
   full Loki encode at CRF 14: about 2100 kbps, detailed and still small; Predict bitrate with 20 clips of 0.2 min gave 2300
   and 2400 (stable, about 10-14% above the real size)
-- "Predict bitrate" (`predict_bitrate()`, `encode_sample()`, row under Rate control): encodes N clips (1-10, default
-  3) of X minutes (default 1) of the selected file with the CURRENT settings, through `build_ffmpeg_cmd()` (same
+- "Predict bitrate" (`predict_bitrate()`, `encode_sample()`, row under Rate control): encodes N clips (1-`PREDICT_MAX_CLIPS` = 20,
+  default `PREDICT_DEFAULT_CLIPS` = 10) of X minutes (0.1 up, default `PREDICT_DEFAULT_CLIP_MIN` = 0.5; the web has the same
+  constants) of the selected file with the CURRENT settings, through `build_ffmpeg_cmd()` (same
   filter chain, encoder, CRF, GPU decode with the same fallback steps), video stream only, in a temp folder; then
   `summarize_bitrates()` gives mean/min/max and the video size the mean predicts (audio and subtitles not included).
   Start times: random (`predict_start_times()`: 5%..95% of the film cut in N bins, one random start per bin) or typed
@@ -105,8 +106,9 @@ Batch-converts a folder of video files to HEVC/AV1. Key pieces:
   thread, which writes `<output>_bitrate.csv` (1-minute steps, `bitrate_csv_text()`: comma-separated `time,kbps[,source_kbps]`, one time column = the middle of each interval, as h:mm:ss) next to the file, also in a
   batch. Tried in the real app on a 130 s synthetic clip (libx265 -> mp4): the CSV appeared and the window opened at the end
 - Live charts (`LiveStats`, `LiveChartWindow`): while a file encodes, a window shows encoding speed (fps), speed against
-  real time and the video bitrate (instantaneous over the last ~20 s, and average), x axis = time elapsed since the file
-  started, a dashed line at each new pass or retry. Same method as the web (`record_progress`): ffmpeg's `size=`/`bitrate=`
+  real time and the video bitrate (instantaneous over the last ~20 s, and average), x axis = POSITION IN THE FILM (the
+  `time_s` of each sample, from 0; fixed 2026-11-15: it used to be the time the encode had been running, so a film of 1:23:05
+  encoded in 17 minutes showed 17:12), only the latest pass or retry is drawn (`live_chart_points()`). Same method as the web (`record_progress`): ffmpeg's `size=`/`bitrate=`
   cover the whole file, so `audio_output_kbps()` is subtracted (re-encoded tracks count their NEW bitrate, 384 for AC-3, not
   the source's 640; copied tracks their declared bitrate; unknown -> nothing subtracted and the title says "video + audio";
   right for constant-bitrate audio, an estimate for TrueHD/FLAC/DTS-HD). `converti_file()` puts one `LiveStats` in
@@ -247,7 +249,7 @@ enforces the "same" rows.
 | GPU decoder drops frames (error lines in the ffmpeg log) | stops the attempt, software fallback by itself | warning in the page: continue / stop / redo in software | different on purpose (software is very slow on gaia) |
 | GPU path | direct QSV first (`-hwaccel qsv`, as the web), then `d3d11va` + `hwmap`, then software | `-hwaccel qsv`, then software | same first choice; the extra d3d11va step exists only on Windows |
 | Default CRF for a 4K source scaled down (QSV) | 14 (`QSV_CRF_DOWNSCALED_4K`, via `crf_suggerito(source_side=)`) | 14 (`QSV_CRF_DOWNSCALED_4K` in `index.html`; the page now also feeds the OUTPUT size after the resolution cap, as the desktop does) | same (tested through node) |
-| Live charts while encoding (fps, speed, video bitrate instantaneous + average, audio subtracted) | `LiveStats`, `parse_progress_line()`, `audio_output_kbps()`, `LiveChartWindow` (a separate window) | `record_progress()`, `parse_progress_line()`, `audio_output_kbps()`, `drawChart()` (inside the page) | same numbers and rules (tested against each other); the desktop shows them in a window, the web in the page |
+| Live charts while encoding (fps, speed, video bitrate instantaneous + average, audio subtracted) | `LiveStats`, `parse_progress_line()`, `audio_output_kbps()`, `LiveChartWindow` (a separate window) | `record_progress()`, `parse_progress_line()`, `audio_output_kbps()`, `drawChart()` (inside the page) | same numbers and rules (tested against each other); x axis = position in the film (`time_s`, NOT the elapsed time: fixed 2026-11-15), only the latest pass, first sample left out (`liveChartPoints()` / `live_chart_points()`, tested through node); the desktop shows them in a window, the web in the page |
 | Bitrate over time of the finished file (exact, per interval, CSV) | `BitrateChartWindow`, `read_video_packets()`, `bucket_bitrates()`, autosave `<output>_bitrate.csv` ("Bitrate CSV" checkbox, h:mm:ss times) | `/api/bitrate_chart`, same two functions, autosave `<output>_bitrate.csv` (seconds) | same method; CSV time columns differ (h:mm:ss vs seconds). Chart of any file with no job: desktop button "Bitrate chart", web button "Bitrate nel tempo del file" (`/api/file_bitrate_chart`); both say where the CSV was saved |
 | Real FPS checked by itself when a file is selected (warning + button only for repeats in a whole ratio, e.g. 60 for 30; 24 stored as 30 is reported and left alone; nothing changed automatically; cached per file) | `_fps_auto_check()`, `classifica_fps()`, `fps_contenuto()`, `analizza_fps()` (thread) | `autoCheckFps()`, `/api/detect_fps` (cache `_fps_cache`) | same measurement, 5 clips of 8 s with mpdecimate; verdicts agree (`test_fps_auto.py`); the desktop also flags a variable rate |
 | Default output container = the source's (mkv -> mkv, mp4/m4v/mov -> mp4, else mkv) | `contenitore_predefinito()` | `containerForSource()` | same (tested through node) |

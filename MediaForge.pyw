@@ -2175,6 +2175,10 @@ def converti_file(src: Path, opts: dict, log_q: queue.Queue, stop_ev: threading.
 
 
 PREDICT_MAX_CLIPS = 20   # clips per prediction (each is a real encode); the clip length can go down to 0.1 min
+# Proposed by default (2026-11-15): 10 clips of 0.5 min. Short clips are noisier one by one, many of them average out:
+# 20 clips of 0.2 min gave 2300 and 2400 kbps against about 2100 for the full encode (stable, 10-14% high).
+PREDICT_DEFAULT_CLIPS = 10
+PREDICT_DEFAULT_CLIP_MIN = 0.5
 PREDICT_EDGE = 0.05 # random clips stay inside 5%..95% of the film (no opening titles / end credits)
 
 
@@ -3074,17 +3078,22 @@ def argomento_avvio():
 
 
 def live_chart_points(samples: list) -> list:
-    """The samples the live charts draw: the first one of every pass or retry is left out, because it is taken while the
-    encoder is still starting up (fps, speed and bitrate are far from the steady values) and it squashes the rest of
-    the chart. The samples themselves are kept as they are."""
-    return [p for i, p in enumerate(samples) if i > 0 and p["pass"] == samples[i - 1]["pass"]]
+    """The samples the live charts draw (same rule as the web, liveChartPoints): only the latest pass or retry (a 2-pass
+    encode runs the film twice, the second is the one that counts), without its first sample, which is taken while the
+    encoder is still starting up (fps, speed and bitrate are far from the steady values) and squashes the rest of the
+    chart; and only samples that have a film time, which is the x axis. The samples themselves are kept as they are."""
+    if not samples:
+        return []
+    ultima = samples[-1]["pass"]
+    return [p for p in [p for p in samples if p["pass"] == ultima][1:] if p.get("time_s") is not None]
 
 
 class LiveChartWindow(tk.Toplevel):
     """Charts of the encode in progress, the same three as the web page: encoding speed (fps), speed against real
     time (x) and the video bitrate (instantaneous and average, with the audio subtracted: see audio_output_kbps).
-    Fed by the ("live", sample) messages of LiveStats; a new file clears it ("live_start"). The x axis is the time
-    elapsed since the file started (a dashed line marks a new pass or retry)."""
+    Fed by the ("live", sample) messages of LiveStats; a new file clears it ("live_start"). The x axis is the position
+    in the film (the time= of ffmpeg, from 0), NOT the time the encode has been running, which is shorter by the
+    encoding speed: a film of 1:23:05 encoded in 17 minutes shows 1:23:05. Only the latest pass is drawn."""
     CHARTS = (
         ("fps", "Encoding speed (frames per second)", "fps", 0, (("fps", "#1f6fd1", 2),)),
         ("speed", "Speed against real time (1× = real time)", "x", 2, (("speed", "#1f6fd1", 2),)),
@@ -3105,8 +3114,8 @@ class LiveChartWindow(tk.Toplevel):
             cv.pack(fill="both", expand=True)
             cv.bind("<Configure>", lambda _e: self._draw_all())
             self._cv[key] = cv
-        ttk.Label(self, text="Bitrate: blue = instantaneous (last ~20 s), grey = average since the start",
-                  foreground="gray").pack(fill="x", padx=10, pady=(2, 6))
+        ttk.Label(self, text="Time axis: position in the film. Bitrate: blue = instantaneous (last ~20 s), "
+                             "grey = average since the start", foreground="gray").pack(fill="x", padx=10, pady=(2, 6))
         self.reset("")
 
     def reset(self, name: str):
@@ -3146,26 +3155,23 @@ class LiveChartWindow(tk.Toplevel):
             hi, lo = hi + 1, lo - 1
         pad = (hi - lo) * 0.1
         lo, hi = max(0.0, lo - pad), hi + pad
-        x0, x1 = pts[0]["t"], max(pts[-1]["t"], pts[0]["t"] + 1)
+        x0, x1 = 0.0, max(pts[-1]["time_s"], 1.0)
         X = lambda t: L + (t - x0) / (x1 - x0) * (w - L - R)
         Y = lambda v: T + (1 - (v - lo) / (hi - lo)) * (h - T - B)
         for v in (lo, (lo + hi) / 2, hi):
             cv.create_line(L, Y(v), w - R, Y(v), fill="#e3e3e3")
             cv.create_text(L - 6, Y(v), text=f"{v:.{dec}f}", anchor="e", fill="#666", font=("Segoe UI", 8))
         n = 5
-        for i in range(n + 1):             # time axis: elapsed time since the file started
+        for i in range(n + 1):             # time axis: position in the film
             t = x0 + (x1 - x0) * i / n
             cv.create_line(X(t), h - B, X(t), h - B + 4, fill="#999")
             cv.create_text(X(t), h - B + 6, text=format_clock(t), anchor="ne" if i == n else "n", fill="#666",
                            font=("Segoe UI", 8))
-        for i in range(1, len(pts)):
-            if pts[i]["pass"] != pts[i - 1]["pass"]:
-                cv.create_line(X(pts[i]["t"]), T, X(pts[i]["t"]), h - B, fill="#999", dash=(3, 3))
         for k, color, width in series:
             line = []
             for p in pts:
                 if p.get(k) is not None:
-                    line += [X(p["t"]), Y(p[k])]
+                    line += [X(p["time_s"]), Y(p[k])]
             if len(line) >= 4:
                 cv.create_line(*line, fill=color, width=width)
         main = [p[series[0][0]] for p in pts if p.get(series[0][0]) is not None]
@@ -3669,10 +3675,10 @@ class App(_BaseTk):
         # Riga 1c: Predict bitrate (short test encodes with the current settings, to see how the CRF will turn out)
         r1c = ttk.Frame(self._frm_video_specific); r1c.pack(fill="x", padx=5, pady=3)
         ttk.Label(r1c, text="Predict bitrate:").pack(side="left")
-        self._var_pred_n = tk.IntVar(value=3)
+        self._var_pred_n = tk.IntVar(value=PREDICT_DEFAULT_CLIPS)
         ttk.Spinbox(r1c, from_=1, to=PREDICT_MAX_CLIPS, textvariable=self._var_pred_n, width=3).pack(side="left", padx=(6, 2))
         ttk.Label(r1c, text="clips of").pack(side="left", padx=2)
-        self._var_pred_min = tk.StringVar(value="1")
+        self._var_pred_min = tk.StringVar(value=str(PREDICT_DEFAULT_CLIP_MIN))
         ttk.Spinbox(r1c, from_=0.1, to=10, increment=0.1, textvariable=self._var_pred_min,
                     width=4).pack(side="left")
         ttk.Label(r1c, text="min").pack(side="left", padx=(2, 12))
